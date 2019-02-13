@@ -23,7 +23,7 @@
 # define X86_MEM 0
 #endif
 
-#ifdef __GNUC__
+#if defined(__GNUC__) || defined(__clang__)
 # ifdef __MINGW32__
    /* gcc 4.7 miscompiles packed structures in MS-bitfield mode */
 #  define PACKME
@@ -92,8 +92,8 @@ static inline void set_16(uint16_t *p, uint16_t v)
     *p = v;
 #else
     uint8_t *pp = (uint8_t *) p;
-    pp[0] = (v & 0xff);
-    pp[1] = ((v >> 8) & 0xff);
+    pp[0] = v;
+    pp[1] = v >> 8;
 #endif
 }
 

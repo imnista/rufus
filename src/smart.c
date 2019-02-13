@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * SMART HDD vs Flash detection (using ATA over USB, S.M.A.R.T., etc.)
- * Copyright © 2013-2014 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2016 Pete Batard <pete@akeo.ie>
  *
  * Based in part on scsiata.cpp from Smartmontools: http://smartmontools.sourceforge.net
  * Copyright © 2006-12 Douglas Gilbert <dgilbert@interlog.com>
@@ -31,8 +31,10 @@
 #include <ctype.h>
 #include <stddef.h>
 
-#include "msapi_utf8.h"
 #include "rufus.h"
+#include "missing.h"
+#include "msapi_utf8.h"
+
 #include "drive.h"
 #include "smart.h"
 #include "hdd_vs_ufd.h"
@@ -43,7 +45,7 @@ static uint8_t GetAtaDirection(uint8_t AtaCmd, uint8_t Features) {
 	// Far from complete -- only the commands we *may* use.
 
 	// Most SMART commands require DATA_IN but there are a couple exceptions
-	BOOL smart_out = (AtaCmd == ATA_SMART_CMD) && 
+	BOOL smart_out = (AtaCmd == ATA_SMART_CMD) &&
 		((Features == ATA_SMART_STATUS) || (Features == ATA_SMART_WRITE_LOG_SECTOR));
 
 	switch (AtaCmd) {
@@ -66,7 +68,7 @@ const char* SptStrerr(int errcode)
 	static char scsi_err[64];
 
 	if ((errcode > 0) && (errcode <= 0xff)) {
-		safe_sprintf(scsi_err, sizeof(scsi_err), "SCSI status: 0x%02X", (uint8_t)errcode);
+		static_sprintf(scsi_err, "SCSI status: 0x%02X", (uint8_t)errcode);
 		return (const char*)scsi_err;
 	}
 
@@ -179,7 +181,7 @@ static int SatAtaPassthrough(HANDLE hPhysical, ATA_PASSTHROUGH_CMD* Command, voi
 	int t_length = 0;   /* 0 -> no data transferred */
 	uint8_t Direction;
 
-	if (BufLen % SelectedDrive.Geometry.BytesPerSector != 0) {
+	if (BufLen % SelectedDrive.SectorSize != 0) {
 		uprintf("SatAtaPassthrough: BufLen must be a multiple of <block size>\n");
 		return SPT_ERROR_BUFFER;
 	}
@@ -310,7 +312,7 @@ static int UsbCypressAtaPassthrough(HANDLE hPhysical, ATA_PASSTHROUGH_CMD* Comma
 }
 
 /* The various bridges we will try, in order */
-AtaPassThroughType pt[] = {
+AtaPassThroughType ata_pt[] = {
 	{ SatAtaPassthrough, "SAT" },
 	{ UsbJmicronAtaPassthrough, "JMicron" },
 	{ UsbProlificAtaPassthrough, "Prolific" },
@@ -329,14 +331,14 @@ BOOL Identify(HANDLE hPhysical)
 	// You'll get an error here if your compiler does not properly pack the IDENTIFY struct
 	COMPILE_TIME_ASSERT(sizeof(IDENTIFY_DEVICE_DATA) == 512);
 
-	idd = (IDENTIFY_DEVICE_DATA*)_aligned_malloc(sizeof(IDENTIFY_DEVICE_DATA), 0x10);
+	idd = (IDENTIFY_DEVICE_DATA*)_mm_malloc(sizeof(IDENTIFY_DEVICE_DATA), 0x10);
 	if (idd == NULL)
 		return FALSE;
 
-	for (i=0; i<ARRAYSIZE(pt); i++) {
-		r = pt[i].fn(hPhysical, &Command, idd, sizeof(IDENTIFY_DEVICE_DATA), SPT_TIMEOUT_VALUE);
+	for (i=0; i<ARRAYSIZE(ata_pt); i++) {
+		r = ata_pt[i].fn(hPhysical, &Command, idd, sizeof(IDENTIFY_DEVICE_DATA), SPT_TIMEOUT_VALUE);
 		if (r == SPT_SUCCESS) {
-			uprintf("Success using %s\n", pt[i].type);
+			uprintf("Success using %s\n", ata_pt[i].type);
 			if (idd->CommandSetSupport.SmartCommands) {
 				DumpBufferHex(idd, sizeof(IDENTIFY_DEVICE_DATA));
 				uprintf("SMART support detected!\n");
@@ -345,12 +347,12 @@ BOOL Identify(HANDLE hPhysical)
 			}
 			break;
 		}
-		uprintf("No joy with: %s (%s)\n", pt[i].type, SptStrerr(r));
+		uprintf("No joy with: %s (%s)\n", ata_pt[i].type, SptStrerr(r));
 	}
-	if (i >= ARRAYSIZE(pt))
+	if (i >= ARRAYSIZE(ata_pt))
 		uprintf("NO ATA FOR YOU!\n");
 
-	_aligned_free(idd);
+	_mm_free(idd);
 	return TRUE;
 }
 #endif
@@ -413,7 +415,7 @@ BOOL SmartGetVersion(HANDLE hdevice)
  * THUS, IF DATA LOSS IS INCURRED DUE TO THIS, OR ANY OTHER PART OF THIS APPLICATION,
  * NOT BEHAVING IN THE MANNER YOU EXPECTED, THE RESPONSIBILITY IS ENTIRELY ON YOU!
  *
- * What you have below, then, is our *current best guess* at differentiating UFDs 
+ * What you have below, then, is our *current best guess* at differentiating UFDs
  * from HDDs. But short of a crystal ball, this remains just a guess, which may be
  * way off mark. Still, you are also reminded that Rufus does produce PROMINENT
  * warnings before you format a drive, and also provides extensive info about the
@@ -426,7 +428,7 @@ BOOL SmartGetVersion(HANDLE hdevice)
  * - some UFDs (SanDisk Extreme) have added S.M.A.R.T. support, which also used to be
  *   reserved for HDDs => can't use that either
  * - even if S.M.A.R.T. was enough, not all USB->IDE or USB->SATA bridges support ATA
- *   passthrough, which is required S.M.A.R.T. data, and each manufacturer of an 
+ *   passthrough, which is required S.M.A.R.T. data, and each manufacturer of an
  *   USB<->(S)ATA bridge seem to have their own method of implementing passthrough.
  * - SSDs have also changed the deal completely, as you can get something that looks
  *   like Flash but that is really an HDD.
@@ -436,7 +438,6 @@ BOOL SmartGetVersion(HANDLE hdevice)
  *   from the above) => there is no magic API we can query that will tell us what we're
  *   really looking at.
  */
-#define GB 1073741824LL
 int IsHDD(DWORD DriveIndex, uint16_t vid, uint16_t pid, const char* strid)
 {
 	int score = 0;

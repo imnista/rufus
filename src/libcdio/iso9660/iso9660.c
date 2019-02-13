@@ -1,5 +1,6 @@
 /*
-  Copyright (C) 2003-2009, 2013-2014 Rocky Bernstein <rocky@gnu.org>
+  Copyright (C) 2003-2009, 2013-2014, 2016-2017 Rocky Bernstein
+  <rocky@gnu.org>
   Copyright (C) 2000 Herbert Valerio Riedel <hvr@gnu.org>
 
   This program is free software: you can redistribute it and/or modify
@@ -91,7 +92,7 @@ timegm(struct tm *tm)
 #endif
 
 #ifndef HAVE_GMTIME_R
-struct tm *
+static struct tm *
 gmtime_r(const time_t *timer, struct tm *result)
 {
     struct tm *tmp = gmtime(timer);
@@ -105,7 +106,7 @@ gmtime_r(const time_t *timer, struct tm *result)
 #endif
 
 #ifndef HAVE_LOCALTIME_R
-struct tm *
+static struct tm *
 localtime_r(const time_t *timer, struct tm *result)
 {
     struct tm *tmp = localtime(timer);
@@ -117,8 +118,6 @@ localtime_r(const time_t *timer, struct tm *result)
     return tmp;
 }
 #endif
-
-static const char _rcsid[] = "$Id: iso9660.c,v 1.41 2008/06/25 08:01:54 rocky Exp $";
 
 /* Variables to hold debugger-helping enumerations */
 enum iso_enum1_s     iso_enums1;
@@ -206,6 +205,11 @@ iso9660_get_dtime (const iso9660_dtime_t *idr_date, bool b_localtime,
   p_tm->tm_sec    = idr_date->dt_second - idr_date->dt_gmtoff * (15 * 60);
   p_tm->tm_isdst  = -1; /* information not available */
 
+#ifdef HAVE_STRUCT_TM_TM_ZONE
+  /* Initialize everything */
+  p_tm->tm_zone   = 0;
+#endif
+
   /* Recompute tm_wday and tm_yday via mktime. mktime will also renormalize
      date values to account for the timezone offset. */
   {
@@ -272,6 +276,10 @@ iso9660_get_ltime (const iso9660_ltime_t *p_ldate,
   p_tm->tm_isdst= -1; /* information not available */
 #ifndef HAVE_TM_GMTOFF
   p_tm->tm_sec += p_ldate->lt_gmtoff * (15 * 60);
+#endif
+#ifdef HAVE_STRUCT_TM_TM_ZONE
+  /* Initialize everything */
+  p_tm->tm_zone = 0;
 #endif
 
   /* Recompute tm_wday and tm_yday via mktime. mktime will also renormalize
@@ -624,8 +632,7 @@ iso9660_set_pvd(void *pd,
   memset(&ipd,0,sizeof(ipd)); /* paranoia? */
 
   /* magic stuff ... thatis CD XA marker... */
-  strncpy(((char*)&ipd)+ISO_XA_MARKER_OFFSET, ISO_XA_MARKER_STRING,
-          sizeof(ISO_XA_MARKER_STRING));
+  strncpy(((char*)&ipd)+ISO_XA_MARKER_OFFSET, ISO_XA_MARKER_STRING,8);
 
   ipd.type = to_711(ISO_VD_PRIMARY);
   iso9660_strncpy_pad (ipd.id, ISO_STANDARD_ID, 5, ISO9660_DCHARS);
@@ -778,7 +785,8 @@ iso9660_dir_add_entry_su(void *dir,
                              ? strlen(filename) : 1); /* working hack! */
 
   memcpy(&idr->filename.str[1], filename, from_711(idr->filename.len));
-  memcpy(&dir8[offset] + su_offset, su_data, su_size);
+  if (su_size > 0 && su_data)
+    memcpy(&dir8[offset] + su_offset, su_data, su_size);
 }
 
 void

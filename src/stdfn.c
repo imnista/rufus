@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Standard Windows function calls
- * Copyright © 2013-2015 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2018 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -24,14 +24,27 @@
 #include <windows.h>
 #include <sddl.h>
 
-#include "msapi_utf8.h"
 #include "rufus.h"
+#include "missing.h"
 #include "resource.h"
-#include "settings.h"
+#include "msapi_utf8.h"
 #include "localization.h"
 
+#include "settings.h"
+
 int  nWindowsVersion = WINDOWS_UNDEFINED;
+int  nWindowsBuildNumber = -1;
 char WindowsVersionStr[128] = "Windows ";
+
+// __popcnt16, __popcnt, __popcnt64 are not available for ARM :(
+uint8_t popcnt8(uint8_t val)
+{
+	static const uint8_t nibble_lookup[16] = {
+		0, 1, 1, 2, 1, 2, 2, 3,
+		1, 2, 2, 3, 2, 3, 3, 4
+	};
+	return nibble_lookup[val & 0x0F] + nibble_lookup[val >> 4];
+}
 
 /*
  * Hash table functions - modified From glibc 2.3.2:
@@ -39,7 +52,7 @@ char WindowsVersionStr[128] = "Windows ";
  * [Knuth]            The Art of Computer Programming, part 3 (6.4)
  */
 
-/* 
+/*
  * For the used double hash method the table size has to be a prime. To
  * correct the user given table size we need a prime test.  This trivial
  * algorithm is adequate because the code is called only during init and
@@ -217,20 +230,39 @@ BOOL is_x64(void)
 	return ret;
 }
 
+int GetCpuArch(void)
+{
+	SYSTEM_INFO info = { 0 };
+	GetNativeSystemInfo(&info);
+	switch (info.wProcessorArchitecture) {
+	case PROCESSOR_ARCHITECTURE_AMD64:
+		return CPU_ARCH_X86_64;
+	case PROCESSOR_ARCHITECTURE_INTEL:
+		return CPU_ARCH_X86_64;
+	// TODO: Set this back to PROCESSOR_ARCHITECTURE_ARM64 when the MinGW headers have it
+	case 12:
+		return CPU_ARCH_ARM_64;
+	case PROCESSOR_ARCHITECTURE_ARM:
+		return CPU_ARCH_ARM_32;
+	default:
+		return CPU_ARCH_UNDEFINED;
+	}
+}
+
 // From smartmontools os_win32.cpp
 void GetWindowsVersion(void)
 {
 	OSVERSIONINFOEXA vi, vi2;
 	const char* w = 0;
 	const char* w64 = "32 bit";
-	char* vptr;
+	char *vptr;
 	size_t vlen;
 	unsigned major, minor;
 	ULONGLONG major_equal, minor_equal;
 	BOOL ws;
 
 	nWindowsVersion = WINDOWS_UNDEFINED;
-	safe_strcpy(WindowsVersionStr, sizeof(WindowsVersionStr), "Windows Undefined");
+	static_strcpy(WindowsVersionStr, "Windows Undefined");
 
 	memset(&vi, 0, sizeof(vi));
 	vi.dwOSVersionInfoSize = sizeof(vi);
@@ -279,20 +311,20 @@ void GetWindowsVersion(void)
 			switch (nWindowsVersion) {
 			case 0x51: w = "XP";
 				break;
-			case 0x52: w = (!GetSystemMetrics(89)?"2003":"2003_R2");
+			case 0x52: w = (!GetSystemMetrics(89)?"Server 2003":"Server 2003_R2");
 				break;
-			case 0x60: w = (ws?"Vista":"2008");
+			case 0x60: w = (ws?"Vista":"Server 2008");
 				break;
-			case 0x61: w = (ws?"7":"2008_R2");
+			case 0x61: w = (ws?"7":"Server 2008_R2");
 				break;
-			case 0x62: w = (ws?"8":"2012");
+			case 0x62: w = (ws?"8":"Server 2012");
 				break;
-			case 0x63: w = (ws?"8.1":"2012_R2");
+			case 0x63: w = (ws?"8.1":"Server 2012_R2");
 				break;
 			case 0x64: w = (ws?"10 (Preview 1)":"Server 10 (Preview 1)");
 				break;
 			// Starting with Windows 10 Preview 2, the major is the same as the public-facing version
-			case 0xA0: w = (ws?"10":"Server 10");
+			case 0xA0: w = (ws?"10":"Server 2016");
 				break;
 			default:
 				if (nWindowsVersion < 0x51)
@@ -318,6 +350,15 @@ void GetWindowsVersion(void)
 		safe_sprintf(vptr, vlen, "%s SP%u %s", w, vi.wServicePackMajor, w64);
 	else
 		safe_sprintf(vptr, vlen, "%s %s", w, w64);
+
+	// Add the build number for Windows 8.0 and later
+	nWindowsBuildNumber = vi.dwBuildNumber;
+	if (nWindowsVersion >= 0x62) {
+		vptr = &WindowsVersionStr[safe_strlen(WindowsVersionStr)];
+		vlen = sizeof(WindowsVersionStr) - safe_strlen(WindowsVersionStr) - 1;
+		safe_sprintf(vptr, vlen, " (Build %d)", nWindowsBuildNumber);
+	}
+
 }
 
 /*
@@ -332,10 +373,10 @@ void StrArrayCreate(StrArray* arr, uint32_t initial_size)
 		uprintf("Could not allocate string array\n");
 }
 
-int32_t StrArrayAdd(StrArray* arr, const char* str)
+int32_t StrArrayAdd(StrArray* arr, const char* str, BOOL duplicate)
 {
 	char** old_table;
-	if ((arr == NULL) || (arr->String == NULL))
+	if ((arr == NULL) || (arr->String == NULL) || (str == NULL))
 		return -1;
 	if (arr->Index == arr->Max) {
 		arr->Max *= 2;
@@ -347,7 +388,7 @@ int32_t StrArrayAdd(StrArray* arr, const char* str)
 			return -1;
 		}
 	}
-	arr->String[arr->Index] = safe_strdup(str);
+	arr->String[arr->Index] = (duplicate)?safe_strdup(str):(char*)str;
 	if (arr->String[arr->Index] == NULL) {
 		uprintf("Could not store string in array\n");
 		return -1;
@@ -355,9 +396,21 @@ int32_t StrArrayAdd(StrArray* arr, const char* str)
 	return arr->Index++;
 }
 
+int32_t StrArrayFind(StrArray* arr, const char* str)
+{
+	uint32_t i;
+	if ((str == NULL) || (arr == NULL) || (arr->String == NULL))
+		return -1;
+	for (i = 0; i<arr->Index; i++) {
+		if (strcmp(arr->String[i], str) == 0)
+			return (int32_t)i;
+	}
+	return -1;
+}
+
 void StrArrayClear(StrArray* arr)
 {
-	size_t i;
+	uint32_t i;
 	if ((arr == NULL) || (arr->String == NULL))
 		return;
 	for (i=0; i<arr->Index; i++) {
@@ -430,7 +483,7 @@ static PSID GetSID(void) {
  */
 BOOL FileIO(BOOL save, char* path, char** buffer, DWORD* size)
 {
-	SECURITY_ATTRIBUTES s_attr, *ps = NULL;
+	SECURITY_ATTRIBUTES s_attr, *sa = NULL;
 	SECURITY_DESCRIPTOR s_desc;
 	PSID sid = NULL;
 	HANDLE handle;
@@ -445,7 +498,7 @@ BOOL FileIO(BOOL save, char* path, char** buffer, DWORD* size)
 		s_attr.nLength = sizeof(SECURITY_ATTRIBUTES);
 		s_attr.bInheritHandle = FALSE;
 		s_attr.lpSecurityDescriptor = &s_desc;
-		ps = &s_attr;
+		sa = &s_attr;
 	} else {
 		uprintf("Could not set security descriptor: %s\n", WindowsErrorString());
 	}
@@ -454,7 +507,7 @@ BOOL FileIO(BOOL save, char* path, char** buffer, DWORD* size)
 		*buffer = NULL;
 	}
 	handle = CreateFileU(path, save?GENERIC_WRITE:GENERIC_READ, FILE_SHARE_READ,
-		ps, save?CREATE_ALWAYS:OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		sa, save?CREATE_ALWAYS:OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if (handle == INVALID_HANDLE_VALUE) {
 		uprintf("Could not %s file '%s'\n", save?"create":"open", path);
@@ -538,26 +591,23 @@ DWORD RunCommand(const char* cmd, const char* dir, BOOL log)
 	DWORD ret, dwRead, dwAvail, dwPipeSize = 4096;
 	STARTUPINFOA si = {0};
 	PROCESS_INFORMATION pi = {0};
+	SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
 	HANDLE hOutputRead = INVALID_HANDLE_VALUE, hOutputWrite = INVALID_HANDLE_VALUE;
-	HANDLE hDupOutputWrite = INVALID_HANDLE_VALUE;
 	static char* output;
 
 	si.cb = sizeof(si);
 	if (log) {
-		// NB: The size of a pipe is a suggestion, NOT an absolute gaurantee
+		// NB: The size of a pipe is a suggestion, NOT an absolute guarantee
 		// This means that you may get a pipe of 4K even if you requested 1K
-		if (!CreatePipe(&hOutputRead, &hOutputWrite, NULL, dwPipeSize)) {
+		if (!CreatePipe(&hOutputRead, &hOutputWrite, &sa, dwPipeSize)) {
 			ret = GetLastError();
 			uprintf("Could not set commandline pipe: %s", WindowsErrorString());
 			goto out;
 		}
-		// We need an inheritable pipe endpoint handle
-		DuplicateHandle(GetCurrentProcess(), hOutputWrite, GetCurrentProcess(), &hDupOutputWrite, 
-			0L, TRUE, DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS);
 		si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
 		si.wShowWindow = SW_HIDE;
-		si.hStdOutput = hDupOutputWrite;
-		si.hStdError = hDupOutputWrite;
+		si.hStdOutput = hOutputWrite;
+		si.hStdError = hOutputWrite;
 	}
 
 	if (!CreateProcessU(NULL, cmd, NULL, NULL, TRUE,
@@ -595,7 +645,7 @@ DWORD RunCommand(const char* cmd, const char* dir, BOOL log)
 	CloseHandle(pi.hThread);
 
 out:
-	safe_closehandle(hDupOutputWrite);
+	safe_closehandle(hOutputWrite);
 	safe_closehandle(hOutputRead);
 	return ret;
 }
@@ -605,6 +655,31 @@ BOOL CompareGUID(const GUID *guid1, const GUID *guid2) {
 		return (memcmp(guid1, guid2, sizeof(GUID)) == 0);
 	}
 	return FALSE;
+}
+
+static BOOL CALLBACK EnumFontFamExProc(const LOGFONTA *lpelfe,
+	const TEXTMETRICA *lpntme, DWORD FontType, LPARAM lParam)
+{
+	return TRUE;
+}
+
+BOOL IsFontAvailable(const char* font_name)
+{
+	BOOL r;
+	LOGFONTA lf = { 0 };
+	HDC hDC = GetDC(hMainDialog);
+
+	if (font_name == NULL) {
+		safe_release_dc(hMainDialog, hDC);
+		return FALSE;
+	}
+
+	lf.lfCharSet = DEFAULT_CHARSET;
+	safe_strcpy(lf.lfFaceName, LF_FACESIZE, font_name);
+
+	r = EnumFontFamiliesExA(hDC, &lf, EnumFontFamExProc, 0, 0);
+	safe_release_dc(hMainDialog, hDC);
+	return r;
 }
 
 /*
@@ -666,9 +741,9 @@ DWORD WINAPI SetLGPThread(LPVOID param)
 	static DWORD original_val;
 	HKEY path_key = NULL, policy_key = NULL;
 	// MSVC is finicky about these ones => redefine them
-	const IID my_IID_IGroupPolicyObject = 
+	const IID my_IID_IGroupPolicyObject =
 		{ 0xea502723L, 0xa23d, 0x11d1, { 0xa7, 0xd3, 0x0, 0x0, 0xf8, 0x75, 0x71, 0xe3 } };
-	const IID my_CLSID_GroupPolicyObject = 
+	const IID my_CLSID_GroupPolicyObject =
 		{ 0xea502722L, 0xa23d, 0x11d1, { 0xa7, 0xd3, 0x0, 0x0, 0xf8, 0x75, 0x71, 0xe3 } };
 	GUID ext_guid = REGISTRY_EXTENSION_GUID;
 	// Can be anything really
@@ -680,19 +755,19 @@ DWORD WINAPI SetLGPThread(LPVOID param)
 	// We need an IGroupPolicyObject instance to set a Local Group Policy
 	hr = CoCreateInstance(&my_CLSID_GroupPolicyObject, NULL, CLSCTX_INPROC_SERVER, &my_IID_IGroupPolicyObject, (LPVOID*)&pLGPO);
 	if (FAILED(hr)) {
-		uprintf("SetLGP: CoCreateInstance failed; hr = %x\n", hr);
+		ubprintf("SetLGP: CoCreateInstance failed; hr = %lx", hr);
 		goto error;
 	}
 
 	hr = pLGPO->lpVtbl->OpenLocalMachineGPO(pLGPO, GPO_OPEN_LOAD_REGISTRY);
 	if (FAILED(hr)) {
-		uprintf("SetLGP: OpenLocalMachineGPO failed - error %x\n", hr);
+		ubprintf("SetLGP: OpenLocalMachineGPO failed - error %lx", hr);
 		goto error;
 	}
 
 	hr = pLGPO->lpVtbl->GetRegistryKey(pLGPO, GPO_SECTION_MACHINE, &path_key);
 	if (FAILED(hr)) {
-		uprintf("SetLGP: GetRegistryKey failed - error %x\n", hr);
+		ubprintf("SetLGP: GetRegistryKey failed - error %lx", hr);
 		goto error;
 	}
 
@@ -700,7 +775,7 @@ DWORD WINAPI SetLGPThread(LPVOID param)
 	r = RegCreateKeyExA(path_key, p->szPath, 0, NULL, 0, KEY_SET_VALUE | KEY_QUERY_VALUE,
 		NULL, &policy_key, &disp);
 	if (r != ERROR_SUCCESS) {
-		uprintf("SetLGP: Failed to open LGPO path %s - error %x\n", p->szPath, hr);
+		ubprintf("SetLGP: Failed to open LGPO path %s - error %lx", p->szPath, hr);
 		policy_key = NULL;
 		goto error;
 	}
@@ -714,7 +789,7 @@ DWORD WINAPI SetLGPThread(LPVOID param)
 			// The Key exists but not its value, which is OK
 			*(p->bExistingKey) = FALSE;
 		} else if (r != ERROR_SUCCESS) {
-			uprintf("SetLGP: Failed to read original %s policy value - error %x\n", p->szPolicy, r);
+			ubprintf("SetLGP: Failed to read original %s policy value - error %lx", p->szPolicy, r);
 		}
 	}
 
@@ -725,7 +800,7 @@ DWORD WINAPI SetLGPThread(LPVOID param)
 		r = RegDeleteValueA(policy_key, p->szPolicy);
 	}
 	if (r != ERROR_SUCCESS) {
-		uprintf("SetLGP: RegSetValueEx / RegDeleteValue failed - error %x\n", r);
+		ubprintf("SetLGP: RegSetValueEx / RegDeleteValue failed - error %lx", r);
 	}
 	RegCloseKey(policy_key);
 	policy_key = NULL;
@@ -733,13 +808,13 @@ DWORD WINAPI SetLGPThread(LPVOID param)
 	// Apply policy
 	hr = pLGPO->lpVtbl->Save(pLGPO, TRUE, (p->bRestore)?FALSE:TRUE, &ext_guid, &snap_guid);
 	if (hr != S_OK) {
-		uprintf("SetLGP: Unable to apply %s policy - error %x\n", p->szPolicy, hr);
+		ubprintf("SetLGP: Unable to apply %s policy - error %lx", p->szPolicy, hr);
 		goto error;
 	} else {
 		if ((!p->bRestore) || (*(p->bExistingKey))) {
-			uprintf("SetLGP: Successfully %s %s policy to 0x%08X\n", (p->bRestore)?"restored":"set", p->szPolicy, val);
+			ubprintf("SetLGP: Successfully %s %s policy to 0x%08lX", (p->bRestore)?"restored":"set", p->szPolicy, val);
 		} else {
-			uprintf("SetLGP: Successfully removed %s policy key\n", p->szPolicy);
+			ubprintf("SetLGP: Successfully removed %s policy key", p->szPolicy);
 		}
 	}
 
@@ -748,8 +823,10 @@ DWORD WINAPI SetLGPThread(LPVOID param)
 	return TRUE;
 
 error:
-	if (path_key != NULL) RegCloseKey(path_key);
-	if (pLGPO != NULL) pLGPO->lpVtbl->Release(pLGPO);
+	if (path_key != NULL)
+		RegCloseKey(path_key);
+	if (pLGPO != NULL)
+		pLGPO->lpVtbl->Release(pLGPO);
 	return FALSE;
 }
 #pragma pop_macro("INTERFACE")
@@ -761,17 +838,17 @@ BOOL SetLGP(BOOL bRestore, BOOL* bExistingKey, const char* szPath, const char* s
 	HANDLE thread_id;
 
 	if (ReadSettingBool(SETTING_DISABLE_LGP)) {
-		uprintf("LPG handling disabled, per settings");
+		ubprintf("LPG handling disabled, per settings");
 		return FALSE;
 	}
 
 	thread_id = CreateThread(NULL, 0, SetLGPThread, (LPVOID)&params, 0, NULL);
 	if (thread_id == NULL) {
-		uprintf("SetLGP: Unable to start thread");
+		ubprintf("SetLGP: Unable to start thread");
 		return FALSE;
 	}
-	if (WaitForSingleObject(thread_id, 2500) != WAIT_OBJECT_0) {
-		uprintf("SetLGP: Killing stuck thread!");
+	if (WaitForSingleObject(thread_id, 5000) != WAIT_OBJECT_0) {
+		ubprintf("SetLGP: Killing stuck thread!");
 		TerminateThread(thread_id, 0);
 		CloseHandle(thread_id);
 		return FALSE;
@@ -779,4 +856,91 @@ BOOL SetLGP(BOOL bRestore, BOOL* bExistingKey, const char* szPath, const char* s
 	if (!GetExitCodeThread(thread_id, &r))
 		return FALSE;
 	return (BOOL) r;
+}
+
+/*
+ * This call tries to evenly balance the affinities for an array of
+ * num_threads, according to the number of cores at our disposal...
+ */
+BOOL SetThreadAffinity(DWORD_PTR* thread_affinity, size_t num_threads)
+{
+	size_t i, j, pc;
+	DWORD_PTR affinity, dummy;
+
+	memset(thread_affinity, 0, num_threads * sizeof(DWORD_PTR));
+	if (!GetProcessAffinityMask(GetCurrentProcess(), &affinity, &dummy))
+		return FALSE;
+	uuprintf("\r\nThread affinities:");
+	uuprintf("  avail:\t%s", printbitslz(affinity));
+
+	// If we don't have enough virtual cores to evenly spread our load forget it
+	pc = popcnt64(affinity);
+	if (pc < num_threads)
+		return FALSE;
+
+	// Spread the affinity as evenly as we can
+	thread_affinity[num_threads - 1] = affinity;
+	for (i = 0; i < num_threads - 1; i++) {
+		for (j = 0; j < pc / num_threads; j++) {
+			thread_affinity[i] |= affinity & (-1LL * affinity);
+			affinity ^= affinity & (-1LL * affinity);
+		}
+		uuprintf("  thr_%d:\t%s", i, printbitslz(thread_affinity[i]));
+		thread_affinity[num_threads - 1] ^= thread_affinity[i];
+	}
+	uuprintf("  thr_%d:\t%s", i, printbitslz(thread_affinity[i]));
+	return TRUE;
+}
+
+/*
+ * Returns true if:
+ * 1. The OS supports UAC, UAC is on, and the current process runs elevated, or
+ * 2. The OS doesn't support UAC or UAC is off, and the process is being run by a member of the admin group
+ */
+BOOL IsCurrentProcessElevated(void)
+{
+	BOOL r = FALSE;
+	DWORD size;
+	HANDLE token = INVALID_HANDLE_VALUE;
+	TOKEN_ELEVATION te;
+	SID_IDENTIFIER_AUTHORITY auth = { SECURITY_NT_AUTHORITY };
+	PSID psid;
+
+	if (ReadRegistryKey32(REGKEY_HKLM, "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\EnableLUA") == 1) {
+		uprintf("Note: UAC is active");
+		if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+			uprintf("Could not get current process token: %s", WindowsErrorString());
+			goto out;
+		}
+		if (!GetTokenInformation(token, TokenElevation, &te, sizeof(te), &size)) {
+			uprintf("Could not get token information: %s", WindowsErrorString());
+			goto out;
+		}
+		r = (te.TokenIsElevated != 0);
+	} else {
+		uprintf("Note: UAC is either disabled or not available");
+		if (!AllocateAndInitializeSid(&auth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+			DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &psid))
+			goto out;
+		if (!CheckTokenMembership(NULL, psid, &r))
+			r = FALSE;
+		FreeSid(psid);
+	}
+
+out:
+	safe_closehandle(token);
+	return r;
+}
+
+char* GetCurrentMUI(void)
+{
+	static char mui_str[LOCALE_NAME_MAX_LENGTH];
+	wchar_t wmui_str[LOCALE_NAME_MAX_LENGTH];
+
+	if (LCIDToLocaleName(GetUserDefaultUILanguage(), wmui_str, LOCALE_NAME_MAX_LENGTH, 0) > 0) {
+		wchar_to_utf8_no_alloc(wmui_str, mui_str, LOCALE_NAME_MAX_LENGTH);
+	} else {
+		static_strcpy(mui_str, "en-US");
+	}
+	return mui_str;
 }

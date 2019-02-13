@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Drive access function calls
- * Copyright © 2011-2015 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2018 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,20 +25,28 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <assert.h>
+#if !defined(__MINGW32__)
+#include <initguid.h>
+#endif
+#include <vds.h>
 
-#include "msapi_utf8.h"
 #include "rufus.h"
-#include "drive.h"
+#include "missing.h"
 #include "resource.h"
+#include "msapi_utf8.h"
+#include "localization.h"
+
+#include "file.h"
+#include "drive.h"
 #include "sys_types.h"
 #include "br.h"
 #include "fat16.h"
 #include "fat32.h"
 #include "ntfs.h"
-#include "localization.h"
 
 #if !defined(PARTITION_BASIC_DATA_GUID)
-const GUID PARTITION_BASIC_DATA_GUID = 
+const GUID PARTITION_BASIC_DATA_GUID =
 	{ 0xebd0a0a2L, 0xb9e5, 0x4433, {0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7} };
 #endif
 #if !defined(PARTITION_MSFT_RESERVED_GUID)
@@ -50,11 +58,24 @@ const GUID PARTITION_SYSTEM_GUID =
 	{ 0xc12a7328L, 0xf81f, 0x11d2, {0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b} };
 #endif
 
+#if defined(__MINGW32__)
+const IID CLSID_VdsLoader = { 0x9c38ed61, 0xd565, 0x4728, { 0xae, 0xee, 0xc8, 0x09, 0x52, 0xf0, 0xec, 0xde } };
+const IID IID_IVdsServiceLoader = { 0xe0393303, 0x90d4, 0x4a97, { 0xab, 0x71, 0xe9, 0xb6, 0x71, 0xee, 0x27, 0x29 } };
+const IID IID_IVdsProvider = { 0x10c5e575, 0x7984, 0x4e81, { 0xa5, 0x6b, 0x43, 0x1f, 0x5f, 0x92, 0xae, 0x42 } };
+const IID IID_IVdsSwProvider = { 0x9aa58360, 0xce33, 0x4f92, { 0xb6, 0x58, 0xed, 0x24, 0xb1, 0x44, 0x25, 0xb8 } };
+const IID IID_IVdsPack = { 0x3b69d7f5, 0x9d94, 0x4648, { 0x91, 0xca, 0x79, 0x93, 0x9b, 0xa2, 0x63, 0xbf } };
+const IID IID_IVdsDisk = { 0x07e5c822, 0xf00c, 0x47a1, { 0x8f, 0xce, 0xb2, 0x44, 0xda, 0x56, 0xfd, 0x06 } };
+const IID IID_IVdsAdvancedDisk = { 0x6e6f6b40, 0x977c, 0x4069, { 0xbd, 0xdd, 0xac, 0x71, 0x00, 0x59, 0xf8, 0xc0 } };
+#endif
+
+PF_TYPE_DECL(NTAPI, NTSTATUS, NtQueryVolumeInformationFile, (HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS));
+
 /*
  * Globals
  */
 RUFUS_DRIVE_INFO SelectedDrive;
-size_t uefi_ntfs_size = 0;
+BOOL installed_uefi_ntfs;
+const char* sfd_name = "Super Floppy Disk";
 
 /*
  * The following methods get or set the AutoMount setting (which is different from AutoRun)
@@ -62,7 +83,7 @@ size_t uefi_ntfs_size = 0;
  * See https://github.com/pbatard/rufus/issues/386.
  *
  * Reverse engineering diskpart and mountvol indicates that the former uses the IVdsService
- * ClearFlags()/SetFlags() to set VDS_SVF_AUTO_MOUNT_OFF whereas mountvol on uses 
+ * ClearFlags()/SetFlags() to set VDS_SVF_AUTO_MOUNT_OFF whereas mountvol on uses
  * IOCTL_MOUNTMGR_SET_AUTO_MOUNT on "\\\\.\\MountPointManager".
  * As the latter is MUCH simpler this is what we'll use too
  */
@@ -104,58 +125,94 @@ BOOL GetAutoMount(BOOL* enabled)
  * clear the MBR of!), so we mitigate the risk by forcing our indexes to belong to
  * the specific range [DRIVE_INDEX_MIN; DRIVE_INDEX_MAX].
  */
-#define CheckDriveIndex(DriveIndex) do { \
-	if ((DriveIndex < DRIVE_INDEX_MIN) || (DriveIndex > DRIVE_INDEX_MAX)) { \
-		uprintf("ERROR: Bad index value. Please check the code!\n"); \
-		goto out; \
-	} \
+#define CheckDriveIndex(DriveIndex) do {                                            \
+	if ((int)DriveIndex < 0) goto out;                                              \
+	assert((DriveIndex >= DRIVE_INDEX_MIN) && (DriveIndex <= DRIVE_INDEX_MAX));     \
+	if ((DriveIndex < DRIVE_INDEX_MIN) || (DriveIndex > DRIVE_INDEX_MAX)) goto out; \
 	DriveIndex -= DRIVE_INDEX_MIN; } while (0)
 
 /*
  * Open a drive or volume with optional write and lock access
  * Return INVALID_HANDLE_VALUE (/!\ which is DIFFERENT from NULL /!\) on failure.
  */
-static HANDLE GetHandle(char* Path, BOOL bWriteAccess, BOOL bLockDrive)
+static HANDLE GetHandle(char* Path, BOOL bLockDrive, BOOL bWriteAccess, BOOL bWriteShare)
 {
 	int i;
+	BYTE access_mask = 0;
 	DWORD size;
+	uint64_t EndTime;
 	HANDLE hDrive = INVALID_HANDLE_VALUE;
+	char DevPath[MAX_PATH];
 
-	if (Path == NULL)
+	if ((safe_strlen(Path) < 5) || (Path[0] != '\\') || (Path[1] != '\\') || (Path[3] != '\\'))
 		goto out;
-	hDrive = CreateFileA(Path, GENERIC_READ|(bWriteAccess?GENERIC_WRITE:0),
-		FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+	// Resolve a device path, so that we can look for that handle in case of access issues.
+	if (QueryDosDeviceA(&Path[4], DevPath, sizeof(DevPath)) == 0)
+		strcpy(DevPath, "???");
+
+	for (i = 0; i < DRIVE_ACCESS_RETRIES; i++) {
+		// Try without FILE_SHARE_WRITE (unless specifically requested) so that
+		// we won't be bothered by the OS or other apps when we set up our data.
+		// However this means we might have to wait for an access gap...
+		// We keep FILE_SHARE_READ though, as this shouldn't hurt us any, and is
+		// required for enumeration.
+		hDrive = CreateFileA(Path, GENERIC_READ|(bWriteAccess?GENERIC_WRITE:0),
+			FILE_SHARE_READ|(bWriteShare?FILE_SHARE_WRITE:0),
+			NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hDrive != INVALID_HANDLE_VALUE)
+			break;
+		if ((GetLastError() != ERROR_SHARING_VIOLATION) && (GetLastError() != ERROR_ACCESS_DENIED))
+			break;
+		if (i == 0) {
+			uprintf("Waiting for access on %s [%s]...", Path, DevPath);
+		} else if (!bWriteShare && (i > DRIVE_ACCESS_RETRIES/3)) {
+			// If we can't seem to get a hold of the drive for some time, try to enable FILE_SHARE_WRITE...
+			uprintf("Warning: Could not obtain exclusive rights. Retrying with write sharing enabled...");
+			bWriteShare = TRUE;
+			// Try to report the process that is locking the drive
+			// We also use bit 6 as a flag to indicate that SearchProcess was called.
+			access_mask = SearchProcess(DevPath, SEARCH_PROCESS_TIMEOUT, TRUE, TRUE, FALSE) | 0x40;
+		}
+		Sleep(DRIVE_ACCESS_TIMEOUT / DRIVE_ACCESS_RETRIES);
+	}
 	if (hDrive == INVALID_HANDLE_VALUE) {
-		uprintf("Could not open drive %s: %s\n", Path, WindowsErrorString());
+		uprintf("Could not open %s: %s", Path, WindowsErrorString());
 		goto out;
 	}
 
 	if (bWriteAccess) {
-		uprintf("Opened drive %s for write access\n", Path);
+		uprintf("Opened %s for %s write access", Path, bWriteShare?"shared":"exclusive");
 	}
 
 	if (bLockDrive) {
 		if (DeviceIoControl(hDrive, FSCTL_ALLOW_EXTENDED_DASD_IO, NULL, 0, NULL, 0, &size, NULL)) {
-			uprintf("I/O boundary checks disabled\n");
+			uprintf("I/O boundary checks disabled");
 		}
 
-		for (i = 0; i < DRIVE_ACCESS_RETRIES; i++) {
+		EndTime = GetTickCount64() + DRIVE_ACCESS_TIMEOUT;
+		do {
 			if (DeviceIoControl(hDrive, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &size, NULL))
 				goto out;
 			if (IS_ERROR(FormatStatus))	// User cancel
 				break;
-			Sleep(DRIVE_ACCESS_TIMEOUT/DRIVE_ACCESS_RETRIES);
-		}
+			Sleep(DRIVE_ACCESS_TIMEOUT / DRIVE_ACCESS_RETRIES);
+		} while (GetTickCount64() < EndTime);
 		// If we reached this section, either we didn't manage to get a lock or the user cancelled
-		uprintf("Could not get exclusive access to device %s: %s\n", Path, WindowsErrorString());
-		safe_closehandle(hDrive);
+		uprintf("Could not lock access to %s: %s", Path, WindowsErrorString());
+		// See if we can report the processes are accessing the drive
+		if (!IS_ERROR(FormatStatus) && (access_mask == 0))
+			access_mask = SearchProcess(DevPath, SEARCH_PROCESS_TIMEOUT, TRUE, TRUE, FALSE);
+		// Try to continue if the only access rights we saw were for read-only
+		if ((access_mask & 0x07) != 0x01)
+			safe_closehandle(hDrive);
 	}
 
 out:
 	return hDrive;
 }
 
-/* 
+/*
  * Return the path to access the physical drive, or NULL on error.
  * The string is allocated and must be freed (to ensure concurrent access)
  */
@@ -165,20 +222,20 @@ char* GetPhysicalName(DWORD DriveIndex)
 	char physical_name[24];
 
 	CheckDriveIndex(DriveIndex);
-	safe_sprintf(physical_name, sizeof(physical_name), "\\\\.\\PHYSICALDRIVE%d", DriveIndex);
+	static_sprintf(physical_name, "\\\\.\\PhysicalDrive%lu", DriveIndex);
 	success = TRUE;
 out:
 	return (success)?safe_strdup(physical_name):NULL;
 }
 
-/* 
+/*
  * Return a handle to the physical drive identified by DriveIndex
  */
-HANDLE GetPhysicalHandle(DWORD DriveIndex, BOOL bWriteAccess, BOOL bLockDrive)
+HANDLE GetPhysicalHandle(DWORD DriveIndex, BOOL bLockDrive, BOOL bWriteAccess, BOOL bWriteShare)
 {
 	HANDLE hPhysical = INVALID_HANDLE_VALUE;
 	char* PhysicalPath = GetPhysicalName(DriveIndex);
-	hPhysical = GetHandle(PhysicalPath, bWriteAccess, bLockDrive);
+	hPhysical = GetHandle(PhysicalPath, bLockDrive, bWriteAccess, bWriteShare);
 	safe_free(PhysicalPath);
 	return hPhysical;
 }
@@ -195,7 +252,7 @@ char* GetLogicalName(DWORD DriveIndex, BOOL bKeepTrailingBackslash, BOOL bSilent
 	HANDLE hDrive = INVALID_HANDLE_VALUE, hVolume = INVALID_HANDLE_VALUE;
 	size_t len;
 	char path[MAX_PATH];
-	VOLUME_DISK_EXTENTS DiskExtents;
+	VOLUME_DISK_EXTENTS_REDEF DiskExtents;
 	DWORD size;
 	UINT drive_type;
 	int i, j;
@@ -204,17 +261,17 @@ char* GetLogicalName(DWORD DriveIndex, BOOL bKeepTrailingBackslash, BOOL bSilent
 
 	CheckDriveIndex(DriveIndex);
 
-	for (i=0; hDrive == INVALID_HANDLE_VALUE; i++) {
+	for (i = 0; hDrive == INVALID_HANDLE_VALUE; i++) {
 		if (i == 0) {
 			hVolume = FindFirstVolumeA(volume_name, sizeof(volume_name));
 			if (hVolume == INVALID_HANDLE_VALUE) {
-				suprintf("Could not access first GUID volume: %s\n", WindowsErrorString());
+				suprintf("Could not access first GUID volume: %s", WindowsErrorString());
 				goto out;
 			}
 		} else {
 			if (!FindNextVolumeA(hVolume, volume_name, sizeof(volume_name))) {
 				if (GetLastError() != ERROR_NO_MORE_FILES) {
-					suprintf("Could not access next GUID volume: %s\n", WindowsErrorString());
+					suprintf("Could not access next GUID volume: %s", WindowsErrorString());
 				}
 				goto out;
 			}
@@ -222,10 +279,9 @@ char* GetLogicalName(DWORD DriveIndex, BOOL bKeepTrailingBackslash, BOOL bSilent
 
 		// Sanity checks
 		len = safe_strlen(volume_name);
-		if ((len <= 1) || (safe_strnicmp(volume_name, volume_start, 4) != 0) || (volume_name[len-1] != '\\')) {
-			suprintf("'%s' is not a GUID volume name\n", volume_name);
-			continue;
-		}
+		assert(len > 4);
+		assert(safe_strnicmp(volume_name, volume_start, 4) == 0);
+		assert(volume_name[len - 1] == '\\');
 
 		drive_type = GetDriveTypeA(volume_name);
 		if ((drive_type != DRIVE_REMOVABLE) && (drive_type != DRIVE_FIXED))
@@ -234,28 +290,27 @@ char* GetLogicalName(DWORD DriveIndex, BOOL bKeepTrailingBackslash, BOOL bSilent
 		volume_name[len-1] = 0;
 
 		if (QueryDosDeviceA(&volume_name[4], path, sizeof(path)) == 0) {
-			suprintf("Failed to get device path for GUID volume '%s': %s\n", volume_name, WindowsErrorString());
+			suprintf("Failed to get device path for GUID volume '%s': %s", volume_name, WindowsErrorString());
 			continue;
 		}
 
 		for (j=0; (j<ARRAYSIZE(ignore_device)) &&
 			(_strnicmp(path, ignore_device[j], safe_strlen(ignore_device[j])) != 0); j++);
 		if (j < ARRAYSIZE(ignore_device)) {
-			suprintf("Skipping GUID volume for '%s'\n", path);
+			suprintf("Skipping GUID volume for '%s'", path);
 			continue;
 		}
 
-		// If we can't have FILE_SHARE_WRITE, forget it
 		hDrive = CreateFileA(volume_name, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE,
 			NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 		if (hDrive == INVALID_HANDLE_VALUE) {
-			suprintf("Could not open GUID volume '%s': %s\n", volume_name, WindowsErrorString());
+			suprintf("Could not open GUID volume '%s': %s", volume_name, WindowsErrorString());
 			continue;
 		}
 
 		if ((!DeviceIoControl(hDrive, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0,
 			&DiskExtents, sizeof(DiskExtents), &size, NULL)) || (size <= 0)) {
-			suprintf("Could not get Disk Extents: %s\n", WindowsErrorString());
+			suprintf("Could not get Disk Extents: %s", WindowsErrorString());
 			safe_closehandle(hDrive);
 			continue;
 		}
@@ -274,13 +329,215 @@ out:
 	return (success)?safe_strdup(volume_name):NULL;
 }
 
+/*
+ * Delete all the partitions from a disk, using VDS
+ * Mostly copied from https://social.msdn.microsoft.com/Forums/vstudio/en-US/b90482ae-4e44-4b08-8731-81915030b32a/createpartition-using-vds-interface-throw-error-enointerface-dcom?forum=vcgeneral
+ */
+BOOL DeletePartitions(DWORD DriveIndex)
+{
+	BOOL r = FALSE;
+	HRESULT hr;
+	ULONG ulFetched;
+	wchar_t wPhysicalName[24];
+	IVdsServiceLoader *pLoader;
+	IVdsService *pService;
+	IEnumVdsObject *pEnum;
+	IUnknown *pUnk;
+
+	CheckDriveIndex(DriveIndex);
+	wnsprintf(wPhysicalName, ARRAYSIZE(wPhysicalName), L"\\\\?\\PhysicalDrive%lu", DriveIndex);
+
+	// Initialize COM
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
+	IGNORE_RETVAL(CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_CONNECT,
+		RPC_C_IMP_LEVEL_IMPERSONATE, NULL, 0, NULL));
+
+	// Create a VDS Loader Instance
+	hr = CoCreateInstance(&CLSID_VdsLoader, NULL, CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER,
+		&IID_IVdsServiceLoader, (void **)&pLoader);
+	if (hr != S_OK) {
+		uprintf("Could not create VDS Loader Instance: hr=%X\n", hr);
+		goto out;
+	}
+
+	// Load the VDS Service
+	hr = IVdsServiceLoader_LoadService(pLoader, L"", &pService);
+	IVdsServiceLoader_Release(pLoader);
+	if (hr != S_OK) {
+		uprintf("Could not load VDS Service: 0x%08X", hr);
+		goto out;
+	}
+
+	// Query the VDS Service Providers
+	hr = IVdsService_QueryProviders(pService, VDS_QUERY_SOFTWARE_PROVIDERS, &pEnum);
+	if (hr != S_OK) {
+		uprintf("Could not query VDS Service Providers: 0x%08X", hr);
+		goto out;
+	}
+
+	while (IEnumVdsObject_Next(pEnum, 1, &pUnk, &ulFetched) == S_OK) {
+		IVdsProvider *pProvider;
+		IVdsSwProvider *pSwProvider;
+		IEnumVdsObject *pEnumPack;
+		IUnknown *pPackUnk;
+
+		// Get VDS Provider
+		hr = IUnknown_QueryInterface(pUnk, &IID_IVdsProvider, (void **)&pProvider);
+		IUnknown_Release(pUnk);
+		if (hr != S_OK) {
+			uprintf("Could not get VDS Provider: 0x%08X", hr);
+			goto out;
+		}
+
+		// Get VDS Software Provider
+		hr = IVdsSwProvider_QueryInterface(pProvider, &IID_IVdsSwProvider, (void **)&pSwProvider);
+		IVdsProvider_Release(pProvider);
+		if (hr != S_OK) {
+			uprintf("Could not get VDS Software Provider: 0x%08X", hr);
+			goto out;
+		}
+
+		// Get VDS Software Provider Packs
+		hr = IVdsSwProvider_QueryPacks(pSwProvider, &pEnumPack);
+		IVdsSwProvider_Release(pSwProvider);
+		if (hr != S_OK) {
+			uprintf("Could not get VDS Software Provider Packs: 0x%08X", hr);
+			goto out;
+		}
+
+		// Enumerate Provider Packs
+		while (IEnumVdsObject_Next(pEnumPack, 1, &pPackUnk, &ulFetched) == S_OK) {
+			IVdsPack *pPack;
+			IEnumVdsObject *pEnumDisk;
+			IUnknown *pDiskUnk;
+
+			hr = IUnknown_QueryInterface(pPackUnk, &IID_IVdsPack, (void **)&pPack);
+			IUnknown_Release(pPackUnk);
+			if (hr != S_OK) {
+				uprintf("Could not query VDS Software Provider Pack: 0x%08X", hr);
+				goto out;
+			}
+
+			// Use the pack interface to access the disks
+			hr = IVdsPack_QueryDisks(pPack, &pEnumDisk);
+			if (hr != S_OK) {
+				uprintf("Could not query VDS disks: 0x%08X", hr);
+				goto out;
+			}
+
+			// List disks
+			while (IEnumVdsObject_Next(pEnumDisk, 1, &pDiskUnk, &ulFetched) == S_OK) {
+				VDS_DISK_PROP diskprop;
+				VDS_PARTITION_PROP* prop_array;
+				LONG i, prop_array_size;
+				IVdsDisk *pDisk;
+				IVdsAdvancedDisk *pAdvancedDisk;
+
+				// Get the disk interface.
+				hr = IUnknown_QueryInterface(pDiskUnk, &IID_IVdsDisk, (void **)&pDisk);
+				if (hr != S_OK) {
+					uprintf("Could not query VDS Disk Interface: 0x%08X", hr);
+					goto out;
+				}
+
+				// Get the disk properties
+				hr = IVdsDisk_GetProperties(pDisk, &diskprop);
+				if (hr != S_OK) {
+					uprintf("Could not query VDS Disk Properties: 0x%08X", hr);
+					goto out;
+				}
+
+				// Isolate the disk we want
+				if (_wcsicmp(wPhysicalName, diskprop.pwszName) != 0) {
+					IVdsDisk_Release(pDisk);
+					continue;
+				}
+
+				// Instantiate the AdvanceDisk interface for our disk.
+				hr = IVdsDisk_QueryInterface(pDisk, &IID_IVdsAdvancedDisk, (void **)&pAdvancedDisk);
+				IVdsDisk_Release(pDisk);
+				if (hr != S_OK) {
+					uprintf("Could not access VDS Advanced Disk interface: 0x%08X", hr);
+					goto out;
+				}
+
+				// Query the partition data, so we can get the start offset, which we need for deletion
+				hr = IVdsAdvancedDisk_QueryPartitions(pAdvancedDisk, &prop_array, &prop_array_size);
+				if (hr != S_OK) {
+					uprintf("No partition to delete on disk '%ws'", diskprop.pwszName);
+					goto out;
+				}
+
+				uprintf("Deleting ALL partitions from disk '%ws':", diskprop.pwszName);
+
+				// Now go through each partition
+				r = (prop_array_size >= 1);
+				for (i = 0; i < prop_array_size; i++) {
+					uprintf("● Partition %d (offset: %lld, size: %s)", prop_array[i].ulPartitionNumber,
+						prop_array[i].ullOffset, SizeToHumanReadable(prop_array[i].ullSize, FALSE, FALSE));
+					hr = IVdsAdvancedDisk_DeletePartition(pAdvancedDisk, prop_array[i].ullOffset, TRUE, TRUE);
+					if (hr != S_OK) {
+						r = FALSE;
+						uprintf("Could not delete partitions: 0x%08X", hr);
+					}
+				}
+				CoTaskMemFree(prop_array);
+
+// NB: In the future, we could try something like this to format partitions:
+#if 0
+				// Initiate formatting and wait for completion.
+				LPWSTR pwszLabel[8] = L"TEST";
+				ULONGLONG Offset = 1024 * 1024;
+				BOOL QuickFormat = TRUE;
+				BOOL EnableCompression = FALSE;
+				IVdsAsync* pAsync;
+				hr = IVdsAdvancedDisk_FormatPartition(pAdvancedDisk, Offset, FileSystemType,
+					pwszLabel, 0, TRUE, QuickFormat, EnableCompression, &pAsync);
+				if (hr != S_OK) {
+					uprintf("Could not start formatting: 0x%08X", hr);
+					goto out;
+				}
+				VDS_ASYNC_OUTPUT AsyncOut;
+				ULONG ulPercentCompleted;
+				HRESULT hr2 = E_FAIL;
+				do {
+					hr = IVdsAsync_QueryStatus(pAsync, &hr2, &ulPercentCompleted);
+					if (SUCCEEDED(hr)) {
+						printf("%ld%%", ulPercentCompleted);
+						if ((hr2 != S_OK) && (hr2 != VDS_E_OPERATION_PENDING)) {
+							uprintf("hr2: %X", hr2);
+							break;
+						}
+						if (hr2 == S_OK) {
+							break;
+						}
+					}
+					Sleep(500);
+				} while (SUCCEEDED(hr));
+				hr = IVdsAsync_Wait(pAsync, &hr2, &AsyncOut);
+				IVdsAsync_Release(pAsync);
+#endif
+				IVdsAdvancedDisk_Release(pAdvancedDisk);
+				goto out;
+			}
+		}
+	}
+
+out:
+	return r;
+}
+
+
 /* Wait for a logical drive to reappear - Used when a drive has just been repartitioned */
 BOOL WaitForLogical(DWORD DriveIndex)
 {
-	DWORD i;
+	uint64_t EndTime;
 	char* LogicalPath = NULL;
 
-	for (i = 0; i < DRIVE_ACCESS_RETRIES; i++) {
+	// GetLogicalName() calls may be slow, so use the system time to
+	// make sure we don't spend more than DRIVE_ACCESS_TIMEOUT in wait.
+	EndTime = GetTickCount64() + DRIVE_ACCESS_TIMEOUT;
+	do {
 		LogicalPath = GetLogicalName(DriveIndex, FALSE, TRUE);
 		if (LogicalPath != NULL) {
 			free(LogicalPath);
@@ -289,27 +546,27 @@ BOOL WaitForLogical(DWORD DriveIndex)
 		if (IS_ERROR(FormatStatus))	// User cancel
 			return FALSE;
 		Sleep(DRIVE_ACCESS_TIMEOUT/DRIVE_ACCESS_RETRIES);
-	}
-	uprintf("Timeout while waiting for logical drive\n");
+	} while (GetTickCount64() < EndTime);
+	uprintf("Timeout while waiting for logical drive");
 	return FALSE;
 }
 
-/* 
+/*
  * Obtain a handle to the first logical volume on the disk identified by DriveIndex
  * Returns INVALID_HANDLE_VALUE on error or NULL if no logical path exists (typical
  * of unpartitioned drives)
  */
-HANDLE GetLogicalHandle(DWORD DriveIndex, BOOL bWriteAccess, BOOL bLockDrive)
+HANDLE GetLogicalHandle(DWORD DriveIndex, BOOL bLockDrive, BOOL bWriteAccess, BOOL bWriteShare)
 {
 	HANDLE hLogical = INVALID_HANDLE_VALUE;
 	char* LogicalPath = GetLogicalName(DriveIndex, FALSE, FALSE);
 
 	if (LogicalPath == NULL) {
-		uprintf("No logical drive found (unpartitioned?)\n");
+		uprintf("No logical drive found (unpartitioned?)");
 		return NULL;
 	}
 
-	hLogical = GetHandle(LogicalPath, bWriteAccess, bLockDrive);
+	hLogical = GetHandle(LogicalPath, bLockDrive, bWriteAccess, bWriteShare);
 	free(LogicalPath);
 	return hLogical;
 }
@@ -358,9 +615,13 @@ static BOOL _GetDriveLettersAndType(DWORD DriveIndex, char* drive_letters, UINT*
 	BOOL r = FALSE;
 	HANDLE hDrive = INVALID_HANDLE_VALUE;
 	UINT _drive_type;
+	IO_STATUS_BLOCK io_status_block;
+	FILE_FS_DEVICE_INFORMATION file_fs_device_info;
 	int i = 0, drive_number;
 	char *drive, drives[26*4 + 1];	/* "D:\", "E:\", etc., plus one NUL */
 	char logical_drive[] = "\\\\.\\#:";
+
+	PF_INIT(NtQueryVolumeInformationFile, Ntdll);
 
 	if (drive_letters != NULL)
 		drive_letters[0] = 0;
@@ -377,11 +638,11 @@ static BOOL _GetDriveLettersAndType(DWORD DriveIndex, char* drive_letters, UINT*
 	// always, as each drive string is at least 4 chars long anyway.
 	size = GetLogicalDriveStringsA(sizeof(drives), drives);
 	if (size == 0) {
-		uprintf("GetLogicalDriveStrings failed: %s\n", WindowsErrorString());
+		uprintf("GetLogicalDriveStrings failed: %s", WindowsErrorString());
 		goto out;
 	}
 	if (size > sizeof(drives)) {
-		uprintf("GetLogicalDriveStrings: Buffer too small (required %d vs. %d)\n", size, sizeof(drives));
+		uprintf("GetLogicalDriveStrings: Buffer too small (required %d vs. %d)", size, sizeof(drives));
 		goto out;
 	}
 
@@ -390,25 +651,30 @@ static BOOL _GetDriveLettersAndType(DWORD DriveIndex, char* drive_letters, UINT*
 		if (!isalpha(*drive))
 			continue;
 		*drive = (char)toupper((int)*drive);
-		if (*drive < 'C') {
-			continue;
-		}
 
-		/* IOCTL_STORAGE_GET_DEVICE_NUMBER's STORAGE_DEVICE_NUMBER.DeviceNumber is
-			not unique! An HDD, a DVD and probably other drives can have the same
-			value there => Use GetDriveType() to filter out unwanted devices.
-			See https://github.com/pbatard/rufus/issues/32 for details. */
+		// IOCTL_STORAGE_GET_DEVICE_NUMBER's STORAGE_DEVICE_NUMBER.DeviceNumber is
+		// not unique! An HDD, a DVD and probably other drives can have the same
+		// value there => Use GetDriveType() to filter out unwanted devices.
+		// See https://github.com/pbatard/rufus/issues/32#issuecomment-3785956
 		_drive_type = GetDriveTypeA(drive);
 
 		if ((_drive_type != DRIVE_REMOVABLE) && (_drive_type != DRIVE_FIXED))
 			continue;
 
-		safe_sprintf(logical_drive, sizeof(logical_drive), "\\\\.\\%c:", drive[0]);
+		static_sprintf(logical_drive, "\\\\.\\%c:", drive[0]);
 		hDrive = CreateFileA(logical_drive, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE,
 			NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 		if (hDrive == INVALID_HANDLE_VALUE) {
-//			uprintf("Warning: could not open drive %c: %s\n", drive[0], WindowsErrorString());
+//			uprintf("Warning: could not open drive %c: %s", drive[0], WindowsErrorString());
 			continue;
+		}
+
+		// Eliminate floppy drives
+		if ((pfNtQueryVolumeInformationFile != NULL) &&
+			(pfNtQueryVolumeInformationFile(hDrive, &io_status_block, &file_fs_device_info,
+				sizeof(file_fs_device_info), FileFsDeviceInformation) == NO_ERROR) &&
+			(file_fs_device_info.Characteristics & FILE_FLOPPY_DISKETTE) ) {
+				continue;
 		}
 
 		drive_number = GetDriveNumber(hDrive, logical_drive);
@@ -453,15 +719,15 @@ char GetUnusedDriveLetter(void)
 
 	size = GetLogicalDriveStringsA(sizeof(drives), drives);
 	if (size == 0) {
-		uprintf("GetLogicalDriveStrings failed: %s\n", WindowsErrorString());
+		uprintf("GetLogicalDriveStrings failed: %s", WindowsErrorString());
 		goto out;
 	}
 	if (size > sizeof(drives)) {
-		uprintf("GetLogicalDriveStrings: Buffer too small (required %d vs. %d)\n", size, sizeof(drives));
+		uprintf("GetLogicalDriveStrings: Buffer too small (required %d vs. %d)", size, sizeof(drives));
 		goto out;
 	}
 
-	for (drive_letter = 'C'; drive_letter < 'Z'; drive_letter++) {
+	for (drive_letter = 'C'; drive_letter <= 'Z'; drive_letter++) {
 		for (drive = drives ;*drive; drive += safe_strlen(drive)+1) {
 			if (!isalpha(*drive))
 				continue;
@@ -484,10 +750,8 @@ BOOL GetDriveLabel(DWORD DriveIndex, char* letters, char** label)
 {
 	HANDLE hPhysical;
 	DWORD size;
-	char AutorunPath[] = "#:\\autorun.inf", *AutorunLabel = NULL;
-	wchar_t wDrivePath[] = L"#:\\";
-	wchar_t wVolumeLabel[MAX_PATH+1];
-	static char VolumeLabel[MAX_PATH+1];
+	static char VolumeLabel[MAX_PATH + 1];
+	char DrivePath[] = "#:\\", AutorunPath[] = "#:\\autorun.inf", *AutorunLabel = NULL;
 
 	*label = STR_NO_LABEL;
 
@@ -499,27 +763,28 @@ BOOL GetDriveLabel(DWORD DriveIndex, char* letters, char** label)
 	}
 	// We only care about an autorun.inf if we have a single volume
 	AutorunPath[0] = letters[0];
-	wDrivePath[0] = letters[0];
+	DrivePath[0] = letters[0];
 
 	// Try to read an extended label from autorun first. Fallback to regular label if not found.
 	// In the case of card readers with no card, users can get an annoying popup asking them
 	// to insert media. Use IOCTL_STORAGE_CHECK_VERIFY to prevent this
-	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE);
+	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE, TRUE);
 	if (DeviceIoControl(hPhysical, IOCTL_STORAGE_CHECK_VERIFY, NULL, 0, NULL, 0, &size, NULL))
 		AutorunLabel = get_token_data_file("label", AutorunPath);
 	else if (GetLastError() == ERROR_NOT_READY)
-		uprintf("Ignoring autorun.inf label for drive %c: %s\n", letters[0],
+		uprintf("Ignoring autorun.inf label for drive %c: %s", letters[0],
 		(HRESULT_CODE(GetLastError()) == ERROR_NOT_READY)?"No media":WindowsErrorString());
 	safe_closehandle(hPhysical);
 	if (AutorunLabel != NULL) {
-		uprintf("Using autorun.inf label for drive %c: '%s'\n", letters[0], AutorunLabel);
-		safe_strcpy(VolumeLabel, sizeof(VolumeLabel), AutorunLabel);
+		uprintf("Using autorun.inf label for drive %c: '%s'", letters[0], AutorunLabel);
+		static_strcpy(VolumeLabel, AutorunLabel);
 		safe_free(AutorunLabel);
 		*label = VolumeLabel;
-	} else if (GetVolumeInformationW(wDrivePath, wVolumeLabel, ARRAYSIZE(wVolumeLabel),
-		NULL, NULL, NULL, NULL, 0) && *wVolumeLabel) {
-		wchar_to_utf8_no_alloc(wVolumeLabel, VolumeLabel, sizeof(VolumeLabel));
+	} else if (GetVolumeInformationU(DrivePath, VolumeLabel, ARRAYSIZE(VolumeLabel),
+		NULL, NULL, NULL, NULL, 0) && (VolumeLabel[0] != 0)) {
 		*label = VolumeLabel;
+	} else {
+		duprintf("Failed to read label: %s", WindowsErrorString());
 	}
 
 	return TRUE;
@@ -536,7 +801,7 @@ uint64_t GetDriveSize(DWORD DriveIndex)
 	BYTE geometry[256];
 	PDISK_GEOMETRY_EX DiskGeometry = (PDISK_GEOMETRY_EX)(void*)geometry;
 
-	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE);
+	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE, TRUE);
 	if (hPhysical == INVALID_HANDLE_VALUE)
 		return FALSE;
 
@@ -558,9 +823,9 @@ BOOL IsMediaPresent(DWORD DriveIndex)
 	DWORD size;
 	BYTE geometry[128];
 
-	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE);
+	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE, TRUE);
 	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-			NULL, 0, geometry, sizeof(geometry), &size, NULL) || (size <= 0);
+			NULL, 0, geometry, sizeof(geometry), &size, NULL) && (size > 0);
 	safe_closehandle(hPhysical);
 	return r;
 }
@@ -575,37 +840,35 @@ const struct {int (*fn)(FILE *fp); char* str;} known_mbr[] = {
 	{ is_rufus_mbr, "Rufus" },
 	{ is_syslinux_mbr, "Syslinux" },
 	{ is_reactos_mbr, "ReactOS" },
-	{ is_kolibri_mbr, "KolibriOS" },
-	{ is_grub_mbr, "Grub4DOS" },
+	{ is_kolibrios_mbr, "KolibriOS" },
+	{ is_grub4dos_mbr, "Grub4DOS" },
 	{ is_grub2_mbr, "Grub 2.0" },
-	{ is_zero_mbr, "Zeroed" },
+	{ is_zero_mbr_not_including_disk_signature_or_copy_protect, "Zeroed" },
 };
 
 // Returns TRUE if the drive seems bootable, FALSE otherwise
-BOOL AnalyzeMBR(HANDLE hPhysicalDrive, const char* TargetName)
+BOOL AnalyzeMBR(HANDLE hPhysicalDrive, const char* TargetName, BOOL bSilent)
 {
 	const char* mbr_name = "Master Boot Record";
-	FILE fake_fd = { 0 };
+	FAKE_FD fake_fd = { 0 };
+	FILE* fp = (FILE*)&fake_fd;
 	int i;
 
-	fake_fd._ptr = (char*)hPhysicalDrive;
-	fake_fd._bufsiz = SelectedDrive.Geometry.BytesPerSector;
-	// Might need correction, as we use this method for images and we may not have a target UFD yet
-	if (fake_fd._bufsiz < 512)
-		fake_fd._bufsiz = 512;
+	fake_fd._handle = (char*)hPhysicalDrive;
+	set_bytes_per_sector(SelectedDrive.SectorSize);
 
-	if (!is_br(&fake_fd)) {
-		uprintf("%s does not have an x86 %s\n", TargetName, mbr_name);
+	if (!is_br(fp)) {
+		suprintf("%s does not have an x86 %s", TargetName, mbr_name);
 		return FALSE;
 	}
 	for (i=0; i<ARRAYSIZE(known_mbr); i++) {
-		if (known_mbr[i].fn(&fake_fd)) {
-			uprintf("%s has a %s %s\n", TargetName, known_mbr[i].str, mbr_name);
+		if (known_mbr[i].fn(fp)) {
+			suprintf("%s has a %s %s", TargetName, known_mbr[i].str, mbr_name);
 			return TRUE;
 		}
 	}
 
-	uprintf("%s has an unknown %s\n", TargetName, mbr_name);
+	suprintf("%s has an unknown %s", TargetName, mbr_name);
 	return TRUE;
 }
 
@@ -623,27 +886,28 @@ const struct {int (*fn)(FILE *fp); char* str;} known_pbr[] = {
 BOOL AnalyzePBR(HANDLE hLogicalVolume)
 {
 	const char* pbr_name = "Partition Boot Record";
-	FILE fake_fd = { 0 };
+	FAKE_FD fake_fd = { 0 };
+	FILE* fp = (FILE*)&fake_fd;
 	int i;
 
-	fake_fd._ptr = (char*)hLogicalVolume;
-	fake_fd._bufsiz = SelectedDrive.Geometry.BytesPerSector;
+	fake_fd._handle = (char*)hLogicalVolume;
+	set_bytes_per_sector(SelectedDrive.SectorSize);
 
-	if (!is_br(&fake_fd)) {
-		uprintf("Volume does not have an x86 %s\n", pbr_name);
+	if (!is_br(fp)) {
+		uprintf("Volume does not have an x86 %s", pbr_name);
 		return FALSE;
 	}
 
-	if (is_fat_16_br(&fake_fd) || is_fat_32_br(&fake_fd)) {
+	if (is_fat_16_br(fp) || is_fat_32_br(fp)) {
 		for (i=0; i<ARRAYSIZE(known_pbr); i++) {
-			if (known_pbr[i].fn(&fake_fd)) {
-				uprintf("Drive has a %s %s\n", known_pbr[i].str, pbr_name);
+			if (known_pbr[i].fn(fp)) {
+				uprintf("Drive has a %s %s", known_pbr[i].str, pbr_name);
 				return TRUE;
 			}
 		}
-		uprintf("Volume has an unknown FAT16 or FAT32 %s\n", pbr_name);
+		uprintf("Volume has an unknown FAT16 or FAT32 %s", pbr_name);
 	} else {
-		uprintf("Volume has an unknown %s\n", pbr_name);
+		uprintf("Volume has an unknown %s", pbr_name);
 	}
 	return TRUE;
 }
@@ -656,15 +920,13 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 {
 	// MBR partition types that can be mounted in Windows
 	const uint8_t mbr_mountable[] = { 0x01, 0x04, 0x06, 0x07, 0x0b, 0x0c, 0x0e, 0xef };
-	BOOL r, ret = FALSE, isUefiNtfs = FALSE;
+	BOOL r, ret = FALSE, isUefiNtfs;
 	HANDLE hPhysical;
-	DWORD size;
+	DWORD size, i, j, super_floppy_disk = FALSE;
 	BYTE geometry[256] = {0}, layout[4096] = {0}, part_type;
 	PDISK_GEOMETRY_EX DiskGeometry = (PDISK_GEOMETRY_EX)(void*)geometry;
 	PDRIVE_LAYOUT_INFORMATION_EX DriveLayout = (PDRIVE_LAYOUT_INFORMATION_EX)(void*)layout;
-	char* volume_name;
-	char tmp[256];
-	DWORD i, j;
+	char *volume_name, *buf;
 
 	if (FileSystemName == NULL)
 		return FALSE;
@@ -674,66 +936,84 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 	FileSystemName[0] = 0;
 	volume_name = GetLogicalName(DriveIndex, TRUE, FALSE);
 	if ((volume_name == NULL) || (!GetVolumeInformationA(volume_name, NULL, 0, NULL, NULL, NULL, FileSystemName, FileSystemNameSize))) {
-		suprintf("No volume information for drive 0x%02x\n", DriveIndex);
+		suprintf("No volume information for drive 0x%02x", DriveIndex);
 	}
 	safe_free(volume_name);
 
-	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE);
+	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE, TRUE);
 	if (hPhysical == INVALID_HANDLE_VALUE)
 		return 0;
-
-	if (uefi_ntfs_size == 0)
-		uefi_ntfs_size = GetResourceSize(hMainInstance, MAKEINTRESOURCEA(IDR_UEFI_NTFS), _RT_RCDATA, "uefi-ntfs.img");
 
 	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
 			NULL, 0, geometry, sizeof(geometry), &size, NULL);
 	if (!r || size <= 0) {
-		suprintf("Could not get geometry for drive 0x%02x: %s\n", DriveIndex, WindowsErrorString());
+		suprintf("Could not get geometry for drive 0x%02x: %s", DriveIndex, WindowsErrorString());
 		safe_closehandle(hPhysical);
 		return 0;
 	}
-	if (DiskGeometry->Geometry.BytesPerSector < 512) {
-		suprintf("Warning: Drive 0x%02x reports a sector size of %d - Correcting to 512 bytes.\n",
-			DriveIndex, DiskGeometry->Geometry.BytesPerSector);
-		DiskGeometry->Geometry.BytesPerSector = 512;
-	}
 	SelectedDrive.DiskSize = DiskGeometry->DiskSize.QuadPart;
-	memcpy(&SelectedDrive.Geometry, &DiskGeometry->Geometry, sizeof(DISK_GEOMETRY));
-	suprintf("Disk type: %s, Sector Size: %d bytes\n", (DiskGeometry->Geometry.MediaType == FixedMedia)?"Fixed":"Removable",
-		DiskGeometry->Geometry.BytesPerSector);
-	suprintf("Cylinders: %" PRIi64 ", TracksPerCylinder: %d, SectorsPerTrack: %d\n",
+	SelectedDrive.SectorSize = DiskGeometry->Geometry.BytesPerSector;
+	SelectedDrive.FirstDataSector = MAXDWORD;
+	if (SelectedDrive.SectorSize < 512) {
+		suprintf("Warning: Drive 0x%02x reports a sector size of %d - Correcting to 512 bytes.",
+			DriveIndex, SelectedDrive.SectorSize);
+		SelectedDrive.SectorSize = 512;
+	}
+	SelectedDrive.SectorsPerTrack = DiskGeometry->Geometry.SectorsPerTrack;
+	SelectedDrive.MediaType = DiskGeometry->Geometry.MediaType;
+
+	suprintf("Disk type: %s, Disk size: %s, Sector size: %d bytes", (SelectedDrive.MediaType == FixedMedia)?"FIXED":"Removable",
+		SizeToHumanReadable(SelectedDrive.DiskSize, FALSE, TRUE), SelectedDrive.SectorSize);
+	suprintf("Cylinders: %" PRIi64 ", Tracks per cylinder: %d, Sectors per track: %d",
 		DiskGeometry->Geometry.Cylinders, DiskGeometry->Geometry.TracksPerCylinder, DiskGeometry->Geometry.SectorsPerTrack);
 
-	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, 
+	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
 			NULL, 0, layout, sizeof(layout), &size, NULL );
 	if (!r || size <= 0) {
-		suprintf("Could not get layout for drive 0x%02x: %s\n", DriveIndex, WindowsErrorString());
+		suprintf("Could not get layout for drive 0x%02x: %s", DriveIndex, WindowsErrorString());
 		safe_closehandle(hPhysical);
 		return 0;
 	}
 
 #if defined(__GNUC__)
-// GCC 4.9 bug us about the fact that MS defined an expandable array as array[1]
+// GCC 4.9 bugs us about the fact that MS defined an expandable array as array[1]
 #pragma GCC diagnostic ignored "-Warray-bounds"
 #endif
 	switch (DriveLayout->PartitionStyle) {
 	case PARTITION_STYLE_MBR:
-		SelectedDrive.PartitionType = PARTITION_STYLE_MBR;
+		SelectedDrive.PartitionStyle = PARTITION_STYLE_MBR;
 		for (i=0; i<DriveLayout->PartitionCount; i++) {
 			if (DriveLayout->PartitionEntry[i].Mbr.PartitionType != PARTITION_ENTRY_UNUSED) {
 				SelectedDrive.nPartitions++;
 			}
 		}
-		suprintf("Partition type: MBR, NB Partitions: %d\n", SelectedDrive.nPartitions);
-		SelectedDrive.has_mbr_uefi_marker = (DriveLayout->Mbr.Signature == MBR_UEFI_MARKER);
-		suprintf("Disk ID: 0x%08X %s\n", DriveLayout->Mbr.Signature, SelectedDrive.has_mbr_uefi_marker?"(UEFI target)":"");
-		AnalyzeMBR(hPhysical, "Drive");
+		// Detect drives that are using the whole disk as a single partition
+		if ((DriveLayout->PartitionEntry[0].Mbr.PartitionType != PARTITION_ENTRY_UNUSED) &&
+			(DriveLayout->PartitionEntry[0].StartingOffset.QuadPart == 0LL)) {
+			suprintf("Partition type: SFD (%s) or Unpartitioned", sfd_name);
+			super_floppy_disk = TRUE;
+		} else {
+			suprintf("Partition type: MBR, NB Partitions: %d", SelectedDrive.nPartitions);
+			SelectedDrive.has_mbr_uefi_marker = (DriveLayout->Mbr.Signature == MBR_UEFI_MARKER);
+			suprintf("Disk ID: 0x%08X %s", DriveLayout->Mbr.Signature, SelectedDrive.has_mbr_uefi_marker?"(UEFI target)":"");
+			AnalyzeMBR(hPhysical, "Drive", bSilent);
+		}
 		for (i=0; i<DriveLayout->PartitionCount; i++) {
+			isUefiNtfs = FALSE;
 			if (DriveLayout->PartitionEntry[i].Mbr.PartitionType != PARTITION_ENTRY_UNUSED) {
 				part_type = DriveLayout->PartitionEntry[i].Mbr.PartitionType;
-				isUefiNtfs = (i == 1) && (part_type == 0xef) &&
-					(DriveLayout->PartitionEntry[i].PartitionLength.QuadPart == uefi_ntfs_size);
-				suprintf("Partition %d%s:\n", i+1, isUefiNtfs?" (UEFI:NTFS)":"");
+				if (part_type == 0xef) {
+					// Check the FAT label to see if we're dealing with an UEFI_NTFS partition
+					buf = calloc(SelectedDrive.SectorSize, 1);
+					if (buf != NULL) {
+						if (SetFilePointerEx(hPhysical, DriveLayout->PartitionEntry[i].StartingOffset, NULL, FILE_BEGIN) &&
+							ReadFile(hPhysical, buf, SelectedDrive.SectorSize, &size, NULL)) {
+							isUefiNtfs = (strncmp(&buf[0x2B], "UEFI_NTFS", 9) == 0);
+						}
+						free(buf);
+					}
+				}
+				suprintf("Partition %d%s:", i+(super_floppy_disk?0:1), isUefiNtfs?" (UEFI:NTFS)":"");
 				for (j=0; j<ARRAYSIZE(mbr_mountable); j++) {
 					if (part_type == mbr_mountable[j]) {
 						ret = TRUE;
@@ -741,12 +1021,15 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 					}
 				}
 				// NB: MinGW's gcc 4.9.2 broke "%lld" printout on XP so we use the inttypes.h "PRI##" qualifiers
-				suprintf("  Type: %s (0x%02x)\r\n  Size: %s (%" PRIi64 " bytes)\r\n  Start Sector: %d, Boot: %s, Recognized: %s\n",
-					((part_type==0x07)&&(FileSystemName[0]!=0))?FileSystemName:GetPartitionType(part_type), part_type,
+				suprintf("  Type: %s (0x%02x)\r\n  Size: %s (%" PRIi64 " bytes)\r\n  Start Sector: %" PRIi64 ", Boot: %s",
+					((part_type==0x07||super_floppy_disk)&&(FileSystemName[0]!=0))?FileSystemName:GetPartitionType(part_type), super_floppy_disk?0:part_type,
 					SizeToHumanReadable(DriveLayout->PartitionEntry[i].PartitionLength.QuadPart, TRUE, FALSE),
-					DriveLayout->PartitionEntry[i].PartitionLength.QuadPart, DriveLayout->PartitionEntry[i].Mbr.HiddenSectors,
-					DriveLayout->PartitionEntry[i].Mbr.BootIndicator?"Yes":"No",
-					DriveLayout->PartitionEntry[i].Mbr.RecognizedPartition?"Yes":"No");
+					DriveLayout->PartitionEntry[i].PartitionLength.QuadPart,
+					DriveLayout->PartitionEntry[i].StartingOffset.QuadPart / SelectedDrive.SectorSize,
+					DriveLayout->PartitionEntry[i].Mbr.BootIndicator?"Yes":"No");
+				// suprintf("  GUID: %s", GuidToString(&DriveLayout->PartitionEntry[i].Mbr.PartitionId));
+				SelectedDrive.FirstDataSector = min(SelectedDrive.FirstDataSector,
+					(DWORD)(DriveLayout->PartitionEntry[i].StartingOffset.QuadPart / SelectedDrive.SectorSize));
 				if ((part_type == RUFUS_EXTRA_PARTITION_TYPE) || (isUefiNtfs))
 					// This is a partition Rufus created => we can safely ignore it
 					--SelectedDrive.nPartitions;
@@ -756,34 +1039,36 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 		}
 		break;
 	case PARTITION_STYLE_GPT:
-		SelectedDrive.PartitionType = PARTITION_STYLE_GPT;
-		suprintf("Partition type: GPT, NB Partitions: %d\n", DriveLayout->PartitionCount);
-		suprintf("Disk GUID: %s\n", GuidToString(&DriveLayout->Gpt.DiskId));
-		suprintf("Max parts: %d, Start Offset: %" PRIi64 ", Usable = %" PRIi64 " bytes\n",
+		SelectedDrive.PartitionStyle = PARTITION_STYLE_GPT;
+		suprintf("Partition type: GPT, NB Partitions: %d", DriveLayout->PartitionCount);
+		suprintf("Disk GUID: %s", GuidToString(&DriveLayout->Gpt.DiskId));
+		suprintf("Max parts: %d, Start Offset: %" PRIi64 ", Usable = %" PRIi64 " bytes",
 			DriveLayout->Gpt.MaxPartitionCount, DriveLayout->Gpt.StartingUsableOffset.QuadPart, DriveLayout->Gpt.UsableLength.QuadPart);
 		for (i=0; i<DriveLayout->PartitionCount; i++) {
 			SelectedDrive.nPartitions++;
-			tmp[0] = 0;
-			wchar_to_utf8_no_alloc(DriveLayout->PartitionEntry[i].Gpt.Name, tmp, sizeof(tmp));
-			suprintf("Partition %d:\r\n  Type: %s\r\n  Name: '%s'\n", i+1,
-				GuidToString(&DriveLayout->PartitionEntry[i].Gpt.PartitionType), tmp);
-			suprintf("  ID: %s\r\n  Size: %s (%" PRIi64 " bytes)\r\n  Start Sector: %" PRIi64 ", Attributes: 0x%016" PRIX64 "\n",
-				GuidToString(&DriveLayout->PartitionEntry[i].Gpt.PartitionId), SizeToHumanReadable(DriveLayout->PartitionEntry[i].PartitionLength.QuadPart, TRUE, FALSE),
-				DriveLayout->PartitionEntry[i].PartitionLength, DriveLayout->PartitionEntry[i].StartingOffset.QuadPart / DiskGeometry->Geometry.BytesPerSector,
+			isUefiNtfs = (wcscmp(DriveLayout->PartitionEntry[i].Gpt.Name, L"UEFI:NTFS") == 0);
+			suprintf("Partition %d%s:\r\n  Type: %s\r\n  Name: '%S'", i+1, isUefiNtfs ? " (UEFI:NTFS)" : "",
+				GuidToString(&DriveLayout->PartitionEntry[i].Gpt.PartitionType), DriveLayout->PartitionEntry[i].Gpt.Name);
+			suprintf("  ID: %s\r\n  Size: %s (%" PRIi64 " bytes)\r\n  Start Sector: %" PRIi64 ", Attributes: 0x%016" PRIX64,
+				GuidToString(&DriveLayout->PartitionEntry[i].Gpt.PartitionId),
+				SizeToHumanReadable(DriveLayout->PartitionEntry[i].PartitionLength.QuadPart, TRUE, FALSE),
+				DriveLayout->PartitionEntry[i].PartitionLength,
+				DriveLayout->PartitionEntry[i].StartingOffset.QuadPart / SelectedDrive.SectorSize,
 				DriveLayout->PartitionEntry[i].Gpt.Attributes);
+			SelectedDrive.FirstDataSector = min(SelectedDrive.FirstDataSector,
+				(DWORD)(DriveLayout->PartitionEntry[i].StartingOffset.QuadPart / SelectedDrive.SectorSize));
 			// Don't register the partitions that we don't care about destroying
-			if ( (strcmp(tmp, "UEFI:NTFS") == 0) ||
+			if ( isUefiNtfs ||
 				 (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_MSFT_RESERVED_GUID)) ||
 				 (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_SYSTEM_GUID)) )
 				--SelectedDrive.nPartitions;
-			if ( (memcmp(&PARTITION_BASIC_DATA_GUID, &DriveLayout->PartitionEntry[i].Gpt.PartitionType, sizeof(GUID)) == 0) &&
-				 (nWindowsVersion >= WINDOWS_VISTA) )
+			if (memcmp(&PARTITION_BASIC_DATA_GUID, &DriveLayout->PartitionEntry[i].Gpt.PartitionType, sizeof(GUID)) == 0)
 				ret = TRUE;
 		}
 		break;
 	default:
-		SelectedDrive.PartitionType = PARTITION_STYLE_MBR;
-		suprintf("Partition type: RAW\n");
+		SelectedDrive.PartitionStyle = PARTITION_STYLE_MBR;
+		suprintf("Partition type: RAW");
 		break;
 	}
 #if defined(__GNUC__)
@@ -807,12 +1092,12 @@ static BOOL FlushDrive(char drive_letter)
 	hDrive = CreateFileA(logical_drive, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE,
 		NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hDrive == INVALID_HANDLE_VALUE) {
-		uprintf("Failed to open %c: for flushing: %s\n", drive_letter, WindowsErrorString());
+		uprintf("Failed to open %c: for flushing: %s", drive_letter, WindowsErrorString());
 		goto out;
 	}
 	r = FlushFileBuffers(hDrive);
 	if (r == FALSE)
-		uprintf("Failed to flush %c: %s\n", drive_letter, WindowsErrorString());
+		uprintf("Failed to flush %c: %s", drive_letter, WindowsErrorString());
 
 out:
 	safe_closehandle(hDrive);
@@ -827,7 +1112,7 @@ BOOL UnmountVolume(HANDLE hDrive)
 	DWORD size;
 
 	if (!DeviceIoControl(hDrive, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &size, NULL)) {
-		uprintf("Could not unmount drive: %s\n", WindowsErrorString());
+		uprintf("Could not unmount drive: %s", WindowsErrorString());
 		return FALSE;
 	}
 	return TRUE;
@@ -849,9 +1134,11 @@ BOOL MountVolume(char* drive_name, char *drive_guid)
 	// than the one we want. If that's the case, we need to unmount first.
 	if ( (GetVolumePathNamesForVolumeNameA(drive_guid, mounted_letter, sizeof(mounted_letter), &size))
 	  && (size > 1) && (mounted_letter[0] != drive_name[0]) ) {
-		uprintf("Volume is already mounted, but as %c: instead of %c: - Unmounting...\n", mounted_letter[0], drive_name[0]);
+		uprintf("Volume is already mounted, but as %c: instead of %c: - Unmounting...", mounted_letter[0], drive_name[0]);
 		if (!DeleteVolumeMountPointA(mounted_letter))
 			uprintf("Failed to unmount volume: %s", WindowsErrorString());
+		// Also delete the destination mountpoint if needed (Don't care about errors)
+		DeleteVolumeMountPointA(drive_name);
 		Sleep(200);
 	}
 
@@ -860,16 +1147,16 @@ BOOL MountVolume(char* drive_name, char *drive_guid)
 		// with ERROR_DIR_NOT_EMPTY. If that's the case, just check that mountpoints match
 		if (GetLastError() == ERROR_DIR_NOT_EMPTY) {
 			if (!GetVolumeNameForVolumeMountPointA(drive_name, mounted_guid, sizeof(mounted_guid))) {
-				uprintf("%s already mounted, but volume GUID could not be checked: %s\n",
+				uprintf("%s already mounted, but volume GUID could not be checked: %s",
 					drive_name, WindowsErrorString());
 				return FALSE;
 			}
 			if (safe_strcmp(drive_guid, mounted_guid) != 0) {
-				uprintf("%s already mounted, but volume GUID doesn't match:\r\n  expected %s, got %s\n",
+				uprintf("%s already mounted, but volume GUID doesn't match:\r\n  expected %s, got %s",
 					drive_name, drive_guid, mounted_guid);
 				return FALSE;
 			}
-			uprintf("%s was already mounted as %s\n", drive_guid, drive_name);
+			uprintf("%s was already mounted as %s", drive_guid, drive_name);
 		} else {
 			return FALSE;
 		}
@@ -936,7 +1223,7 @@ char* AltMountVolume(const char* drive_name, uint8_t part_nr)
 		uprintf("Could not find partition mapping for %s", target[0]);
 		goto out;
 	}
-	
+
 	while ((--i > 0) && (isdigit(p[i])));
 	p[++i] = '0' + part_nr;
 	p[++i] = 0;
@@ -988,15 +1275,15 @@ BOOL RemountVolume(char* drive_name)
 		if (DeleteVolumeMountPointA(drive_name)) {
 			Sleep(200);
 			if (MountVolume(drive_name, drive_guid)) {
-				uprintf("Successfully remounted %s on %s\n", &drive_guid[4], drive_name);
+				uprintf("Successfully remounted %s on %C:", drive_guid, drive_name[0]);
 			} else {
-				uprintf("Failed to remount %s on %s\n", &drive_guid[4], drive_name);
+				uprintf("Failed to remount %s on %C:", drive_guid, drive_name[0]);
 				// This will leave the drive inaccessible and must be flagged as an error
 				FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_REMOUNT_VOLUME);
 				return FALSE;
 			}
 		} else {
-			uprintf("Could not remount %s %s\n", drive_name, WindowsErrorString());
+			uprintf("Could not remount %C: %s", drive_name[0], WindowsErrorString());
 			// Try to continue regardless
 		}
 	}
@@ -1023,27 +1310,32 @@ typedef struct _DRIVE_LAYOUT_INFORMATION_EX4 {
  */
 BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL mbr_uefi_marker, uint8_t extra_partitions)
 {
-	const char* PartitionTypeName[2] = { "MBR", "GPT" };
+	const char* PartitionTypeName[] = { "MBR", "GPT", "SFD" };
 	unsigned char* buffer;
+	size_t uefi_ntfs_size = 0;
 	CREATE_DISK CreateDisk = {PARTITION_STYLE_RAW, {{0}}};
 	DRIVE_LAYOUT_INFORMATION_EX4 DriveLayoutEx = {0};
 	BOOL r;
 	DWORD i, size, bufsize, pn = 0;
 	LONGLONG main_part_size_in_sectors, extra_part_size_in_tracks = 0, ms_efi_size;
-	const LONGLONG bytes_per_track = ((LONGLONG)SelectedDrive.Geometry.SectorsPerTrack) * SelectedDrive.Geometry.BytesPerSector;
+	const LONGLONG bytes_per_track = ((LONGLONG)SelectedDrive.SectorsPerTrack) * SelectedDrive.SectorSize;
 
 	PrintInfoDebug(0, MSG_238, PartitionTypeName[partition_style]);
 
-	if ((extra_partitions & XP_UEFI_NTFS) && (uefi_ntfs_size == 0)) {
+	if (partition_style == PARTITION_STYLE_SFD)
+		// Nothing to do
+		return TRUE;
+
+	if (extra_partitions & XP_UEFI_NTFS) {
 		uefi_ntfs_size = GetResourceSize(hMainInstance, MAKEINTRESOURCEA(IDR_UEFI_NTFS), _RT_RCDATA, "uefi-ntfs.img");
 		if (uefi_ntfs_size == 0)
 			return FALSE;
 	}
 
 	// Compute the start offset of our first partition
-	if ((partition_style == PARTITION_STYLE_GPT) || (!IsChecked(IDC_EXTRA_PARTITION))) {
+	if ((partition_style == PARTITION_STYLE_GPT) || (!IsChecked(IDC_OLD_BIOS_FIXES))) {
 		// Go with the MS 1 MB wastage at the beginning...
-		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = 1024*1024;
+		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = MB;
 	} else {
 		// Align on Cylinder
 		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = bytes_per_track;
@@ -1052,7 +1344,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	// If required, set the MSR partition (GPT only - must be created before the data part)
 	if ((partition_style == PARTITION_STYLE_GPT) && (extra_partitions & XP_MSR)) {
 		uprintf("Adding MSR partition");
-		DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart = 128*1024*1024;
+		DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart = 128*MB;
 		DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_MSFT_RESERVED_GUID;
 		IGNORE_RETVAL(CoCreateGuid(&DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionId));
 		// coverity[strcpy_overrun]
@@ -1063,7 +1355,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 			bufsize = 65536;	// 64K should be enough for everyone
 			buffer = calloc(bufsize, 1);
 			if (buffer != NULL) {
-				if ((!WriteFile(hDrive, buffer, bufsize, &size, NULL)) || (size != bufsize))
+				if (!WriteFileWithRetry(hDrive, buffer, bufsize, &size, WRITE_RETRIES))
 					uprintf("  Could not zero MSR: %s", WindowsErrorString());
 				free(buffer);
 			}
@@ -1077,7 +1369,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	// Set our main data partition
 	main_part_size_in_sectors = (SelectedDrive.DiskSize - DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart) /
 		// Need 33 sectors at the end for secondary GPT
-		SelectedDrive.Geometry.BytesPerSector - ((partition_style == PARTITION_STYLE_GPT)?33:0);
+		SelectedDrive.SectorSize - ((partition_style == PARTITION_STYLE_GPT)?33:0);
 	if (main_part_size_in_sectors <= 0)
 		return FALSE;
 
@@ -1085,29 +1377,30 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	if (extra_partitions) {
 		uprintf("Adding extra partition");
 		if (extra_partitions & XP_EFI) {
-			// The size of the EFI partition depends on the minimum size we're able to format in FAT32,
-			// which in turn depends on the cluster size used, which in turn depends on the disk sector size.
-			if (SelectedDrive.Geometry.BytesPerSector <= 1024)
-				ms_efi_size = 100*1024*1024;
-			else if (SelectedDrive.Geometry.BytesPerSector <= 4096)
-				ms_efi_size = 300*1024*1024;
+			// The size of the EFI partition depends on the minimum size we're able to format in FAT32, which
+			// in turn depends on the cluster size used, which in turn depends on the disk sector size.
+			// Plus some people are complaining that the *OFFICIAL MINIMUM SIZE* as documented by Microsoft at
+			// https://docs.microsoft.com/en-us/windows-hardware/manufacture/desktop/configure-uefigpt-based-hard-drive-partitions
+			// is too small. See: https://github.com/pbatard/rufus/issues/979
+			if (SelectedDrive.SectorSize <= 4096)
+				ms_efi_size = 300*MB;
 			else
-				ms_efi_size = 1200*1024*1024;	// That'll teach you to have a nonstandard disk!
+				ms_efi_size = 1200*MB;	// That'll teach you to have a nonstandard disk!
 			extra_part_size_in_tracks = (ms_efi_size + bytes_per_track - 1) / bytes_per_track;
 		} else if (extra_partitions & XP_UEFI_NTFS)
-			extra_part_size_in_tracks = (MIN_EXTRA_PART_SIZE + bytes_per_track - 1) / bytes_per_track;
+			extra_part_size_in_tracks = (max(MIN_EXTRA_PART_SIZE, uefi_ntfs_size) + bytes_per_track - 1) / bytes_per_track;
 		else if (extra_partitions & XP_COMPAT)
 			extra_part_size_in_tracks = 1;	// One track for the extra partition
 		uprintf("Reserved %" PRIi64" tracks (%s) for extra partition", extra_part_size_in_tracks,
 			SizeToHumanReadable(extra_part_size_in_tracks * bytes_per_track, TRUE, FALSE));
-		main_part_size_in_sectors = ((main_part_size_in_sectors / SelectedDrive.Geometry.SectorsPerTrack) -
-			extra_part_size_in_tracks) * SelectedDrive.Geometry.SectorsPerTrack;
+		main_part_size_in_sectors = ((main_part_size_in_sectors / SelectedDrive.SectorsPerTrack) -
+			extra_part_size_in_tracks) * SelectedDrive.SectorsPerTrack;
 		if (main_part_size_in_sectors <= 0)
 			return FALSE;
 	}
-	DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart = main_part_size_in_sectors * SelectedDrive.Geometry.BytesPerSector;
+	DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart = main_part_size_in_sectors * SelectedDrive.SectorSize;
 	if (partition_style == PARTITION_STYLE_MBR) {
-		DriveLayoutEx.PartitionEntry[pn].Mbr.BootIndicator = IsChecked(IDC_BOOT);
+		DriveLayoutEx.PartitionEntry[pn].Mbr.BootIndicator = (bt != BT_NON_BOOTABLE);
 		switch (file_system) {
 		case FS_FAT16:
 			DriveLayoutEx.PartitionEntry[pn].Mbr.PartitionType = 0x0e;	// FAT16 LBA
@@ -1122,7 +1415,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 			DriveLayoutEx.PartitionEntry[pn].Mbr.PartitionType = 0x0c;	// FAT32 LBA
 			break;
 		default:
-			uprintf("Unsupported file system\n");
+			uprintf("Unsupported file system");
 			return FALSE;
 		}
 	} else {
@@ -1138,7 +1431,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = DriveLayoutEx.PartitionEntry[pn-1].StartingOffset.QuadPart +
 			DriveLayoutEx.PartitionEntry[pn-1].PartitionLength.QuadPart;
 		DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart = (extra_partitions & XP_UEFI_NTFS)?uefi_ntfs_size:
-			extra_part_size_in_tracks * SelectedDrive.Geometry.SectorsPerTrack * SelectedDrive.Geometry.BytesPerSector;
+			extra_part_size_in_tracks * SelectedDrive.SectorsPerTrack * SelectedDrive.SectorSize;
 		if (partition_style == PARTITION_STYLE_GPT) {
 			DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = (extra_partitions & XP_UEFI_NTFS)?
 				PARTITION_BASIC_DATA_GUID:PARTITION_SYSTEM_GUID;
@@ -1148,7 +1441,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 			DriveLayoutEx.PartitionEntry[pn].Mbr.PartitionType = (extra_partitions & XP_UEFI_NTFS)?0xef:RUFUS_EXTRA_PARTITION_TYPE;
 			if (extra_partitions & XP_COMPAT)
 				// Set the one track compatibility partition to be all hidden sectors
-				DriveLayoutEx.PartitionEntry[pn].Mbr.HiddenSectors = SelectedDrive.Geometry.SectorsPerTrack;
+				DriveLayoutEx.PartitionEntry[pn].Mbr.HiddenSectors = SelectedDrive.SectorsPerTrack;
 		}
 
 		// We need to write the UEFI:NTFS partition before we refresh the disk
@@ -1163,14 +1456,11 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 				uprintf("Could not access uefi-ntfs.img");
 				return FALSE;
 			}
-			r = WriteFile(hDrive, buffer, bufsize, &size, NULL);
-			if ((!r) || (size != bufsize)) {
-				if (!r)
-					uprintf("Write error: %s", WindowsErrorString());
-				else
-					uprintf("Write error: Wrote %d bytes, expected %d bytes\n", size, bufsize);
+			if(!WriteFileWithRetry(hDrive, buffer, bufsize, &size, WRITE_RETRIES)) {
+				uprintf("Write error: %s", WindowsErrorString());
 				return FALSE;
 			}
+			installed_uefi_ntfs = TRUE;
 		}
 		pn++;
 	}
@@ -1189,7 +1479,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		// This helps us reselect the partition scheme option that was used when creating the
 		// drive in Rufus. As far as I can tell, Windows doesn't care much if this signature
 		// isn't unique for USB drives.
-		CreateDisk.Mbr.Signature = mbr_uefi_marker?MBR_UEFI_MARKER:GetTickCount();
+		CreateDisk.Mbr.Signature = mbr_uefi_marker?MBR_UEFI_MARKER:(DWORD)GetTickCount64();
 
 		DriveLayoutEx.PartitionStyle = PARTITION_STYLE_MBR;
 		DriveLayoutEx.PartitionCount = 4;	// Must be multiple of 4 for MBR
@@ -1210,8 +1500,8 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		DriveLayoutEx.PartitionStyle = PARTITION_STYLE_GPT;
 		DriveLayoutEx.PartitionCount = pn;
 		// At the very least, a GPT disk has 34 reserved sectors at the beginning and 33 at the end.
-		DriveLayoutEx.Type.Gpt.StartingUsableOffset.QuadPart = 34 * SelectedDrive.Geometry.BytesPerSector;
-		DriveLayoutEx.Type.Gpt.UsableLength.QuadPart = SelectedDrive.DiskSize - (34+33) * SelectedDrive.Geometry.BytesPerSector;
+		DriveLayoutEx.Type.Gpt.StartingUsableOffset.QuadPart = 34 * SelectedDrive.SectorSize;
+		DriveLayoutEx.Type.Gpt.UsableLength.QuadPart = SelectedDrive.DiskSize - (34+33) * SelectedDrive.SectorSize;
 		DriveLayoutEx.Type.Gpt.MaxPartitionCount = MAX_GPT_PARTITIONS;
 		DriveLayoutEx.Type.Gpt.DiskId = CreateDisk.Gpt.DiskId;
 		break;
@@ -1221,14 +1511,14 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	size = sizeof(CreateDisk);
 	r = DeviceIoControl(hDrive, IOCTL_DISK_CREATE_DISK, (BYTE*)&CreateDisk, size, NULL, 0, &size, NULL );
 	if (!r) {
-		uprintf("Could not reset disk: %s\n", WindowsErrorString());
+		uprintf("Could not reset disk: %s", WindowsErrorString());
 		return FALSE;
 	}
 
 	size = sizeof(DriveLayoutEx) - ((partition_style == PARTITION_STYLE_GPT)?((4-pn)*sizeof(PARTITION_INFORMATION_EX)):0);
 	r = DeviceIoControl(hDrive, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, (BYTE*)&DriveLayoutEx, size, NULL, 0, &size, NULL );
 	if (!r) {
-		uprintf("Could not set drive layout: %s\n", WindowsErrorString());
+		uprintf("Could not set drive layout: %s", WindowsErrorString());
 		return FALSE;
 	}
 
@@ -1246,12 +1536,12 @@ BOOL RefreshDriveLayout(HANDLE hDrive)
 	// Diskpart does call the following IOCTL this after updating the partition table, so we do too
 	r = DeviceIoControl(hDrive, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &size, NULL );
 	if (!r)
-		uprintf("Could not refresh drive layout: %s\n", WindowsErrorString());
+		uprintf("Could not refresh drive layout: %s", WindowsErrorString());
 	return r;
 }
 
-/* Delete the disk partition table */
-BOOL DeletePartitions(HANDLE hDrive)
+/* Initialize disk for partitioning */
+BOOL InitializeDisk(HANDLE hDrive)
 {
 	BOOL r;
 	DWORD size;
@@ -1263,19 +1553,19 @@ BOOL DeletePartitions(HANDLE hDrive)
 	r = DeviceIoControl(hDrive, IOCTL_DISK_CREATE_DISK,
 			(BYTE*)&CreateDisk, size, NULL, 0, &size, NULL );
 	if (!r) {
-		uprintf("Could not delete drive layout: %s\n", WindowsErrorString());
+		uprintf("Could not delete drive layout: %s", WindowsErrorString());
 		safe_closehandle(hDrive);
 		return FALSE;
 	}
 
 	r = DeviceIoControl(hDrive, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &size, NULL );
 	if (!r) {
-		uprintf("Could not refresh drive layout: %s\n", WindowsErrorString());
+		uprintf("Could not refresh drive layout: %s", WindowsErrorString());
 		safe_closehandle(hDrive);
 		return FALSE;
-}
+	}
 
-return TRUE;
+	return TRUE;
 }
 
 /*

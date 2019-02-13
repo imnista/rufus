@@ -3,12 +3,12 @@
  * SMART HDD vs Flash detection - isHDD() tables
  * Copyright © 2013-2014 Pete Batard <pete@akeo.ie>
  *
- * Based in part on drivedb.h from Smartmontools: 
+ * Based in part on drivedb.h from Smartmontools:
  * http://svn.code.sf.net/p/smartmontools/code/trunk/smartmontools/drivedb.h
  * Copyright © 2003-11 Philip Williams, Bruce Allen
  * Copyright © 2008-13 Christian Franke <smartmontools-support@lists.sourceforge.net>
  *
- * Also based on entries listed in the identification flash database 
+ * Also based on entries listed in the identification flash database
  * (http://flashboot.ru/iflash/saved/) as well as the Linux USB IDs
  * (http://www.linux-usb.org/usb.ids)
  *
@@ -60,7 +60,6 @@ static str_score_t str_score[] = {
 	{ "MX#", 10 },
 	{ "WDC", 10 },
 	{ "IBM", 10 },
-	{ "OCZ", 5 },
 	{ "STM#", 10 },
 	{ "HDS#", 10 },		// These Hitachi drives are a PITA
 	{ "HDP#", 10 },
@@ -73,16 +72,24 @@ static str_score_t str_score[] = {
 	{ "MAXTOR", 10 },
 	{ "HITACHI", 10 },
 	{ "SEAGATE", 10 },
-	{ "SAMSUNG", 10 },
+	{ "SAMSUNG", 5 },
 	{ "FUJITSU", 10 },
 	{ "TOSHIBA", 5 },
 	{ "QUANTUM", 10 },
 	{ "EXCELSTOR", 10 },
+	{ "CORSAIR", -15 },
+	{ "KINGMAX", -15 },
+	{ "KINGSTON", -15 },
+	{ "LEXAR", -15 },
 	{ "MUSHKIN", -15 },
+	{ "PNY", -15 },
+	{ "SANDISK", -15 },
+	{ "TRANSCEND", -15 },
 };
 
 static str_score_t str_adjust[] = {
 	{ "Gadget", -10 },
+	{ "Flash", -10 }
 };
 
 /* The lists belows set a score according to VID & VID:PID
@@ -99,6 +106,7 @@ static str_score_t str_adjust[] = {
 static vid_score_t vid_score[] = {
 	{ 0x0011, -5 },		// Kingston
 	{ 0x03f0, -5 },		// HP
+	{ 0x0409, -10 },	// NEC/Toshiba
 	{ 0x0411, 5 },		// Buffalo
 	{ 0x0420, -5 },		// Chipsbank
 	{ 0x046d, -5 },		// Logitech
@@ -109,7 +117,8 @@ static vid_score_t vid_score[] = {
 	{ 0x04e8, 5 },		// Samsung
 	{ 0x04f3, -5 },		// Elan
 	{ 0x04fc, 5 },		// Sunplus
-	{ 0x058f, -2 },		// Alcor
+	{ 0x056e, -5 },		// Elecom
+	{ 0x058f, -5 },		// Alcor
 	{ 0x059b, 7 },		// Iomega
 	{ 0x059f, 5 },		// LaCie
 	{ 0x05ab, 10 },		// In-System Design
@@ -119,7 +128,7 @@ static vid_score_t vid_score[] = {
 	{ 0x0718, -2 },		// Imation
 	{ 0x0781, -5 },		// SanDisk
 	{ 0x07ab, 8 },		// Freecom
-	{ 0x090c, -5 },		// Silicon Motion
+	{ 0x090c, -5 },		// Silicon Motion (also used by Samsung)
 	{ 0x0928, 10 },		// PLX Technology
 	{ 0x0930, -8 },		// Toshiba
 	{ 0x093a, -5 },		// Pixart
@@ -146,7 +155,7 @@ static vid_score_t vid_score[] = {
 	{ 0x1516, -5 },		// CompUSA
 	{ 0x152d, 10 },		// JMicron
 	{ 0x1687, -5 },		// Kingmax
-	{ 0x174c, 8 },		// ASMedia
+	{ 0x174c, 3 },		// ASMedia (also used by SanDisk)
 	{ 0x1759, 8 },		// LucidPort
 	{ 0x18a5, -2 },		// Verbatim
 	{ 0x18ec, -5 },		// Arkmicro
@@ -208,7 +217,7 @@ static vidpid_score_t vidpid_score[] = {
 	{ 0x18a5, 0x0237, 10 },		// Verbatim Portable Hard Drive (500 GB)
 	// SunPlus seem to have a bunch of UFDs
 	{ 0x1bcf, 0x0c31, 10 },		// SunplusIT
-	// Plenty of Innostor UFDs 
+	// Plenty of Innostor UFDs
 	{ 0x1f75, 0x0888, 10 },		// Innostor IS888
 	// NOT in VID list as plenty of UFDs
 	{ 0x3538, 0x0902, 10 },		// PQI H560
@@ -237,29 +246,37 @@ static vidpid_score_t vidpid_score[] = {
 	{ 0x04e8, 0x6845, -20 },	// 16 GB UFD
 	{ 0x04e8, 0x685E, -20 },	// 16 GB UFD
 	// Sunplus exceptions
-	{ 0x04fc, 0x05d8, -20 },	// Verbatim flash drive
-	{ 0x04fc, 0x5720, -20 },	// Card reader
+	{ 0x04fc, 0x05d8, -20 },	// Verbatim Flash Drive
+	{ 0x04fc, 0x5720, -20 },	// Card Reader
 	// LaCie exceptions
 	{ 0x059f, 0x1027, -20 },	// 16 GB UFD
 	{ 0x059f, 0x103B, -20 },	// 16 GB UFD
 	{ 0x059f, 0x1064, -20 },	// 16 GB UFD
 	// Prolific exceptions
+	{ 0x067b, 0x2506, -20 },	// 8 GB Micro Hard Drive
 	{ 0x067b, 0x2517, -20 },	// 1 GB UFD
 	{ 0x067b, 0x2528, -20 },	// 8 GB UFD
+	{ 0x067b, 0x2731, -20 },	// SD/TF Card Reader
 	{ 0x067b, 0x3400, -10 },	// Hi-Speed Flash Disk with TruePrint AES3400
 	{ 0x067b, 0x3500, -10 },	// Hi-Speed Flash Disk with TruePrint AES3500
 	// Freecom exceptions
 	{ 0x07ab, 0xfcab, -20 },	// 4 GB UFD
+	// Samsung exceptions
+	{ 0x090c, 0x1000, -20 },	// Samsung Flash Drive
 	// Toshiba exceptions
 	{ 0x0930, 0x1400, -20 },
 	{ 0x0930, 0x6533, -20 },
 	{ 0x0930, 0x653e, -20 },
 	{ 0x0930, 0x6544, -20 },
 	{ 0x0930, 0x6545, -20 },
+	// Innostor exceptions
+	{ 0x0BC2, 0x03312, -20 },
 	// Verbatim exceptions
 	{ 0x18a5, 0x0243, -20 },
 	{ 0x18a5, 0x0245, -20 },
 	{ 0x18a5, 0x0302, -20 },
 	{ 0x18a5, 0x0304, -20 },
 	{ 0x18a5, 0x3327, -20 },
+	// More Innostor
+	{ 0x1f75, 0x0917, -10 },	// Intenso Speed Line USB Device
 };

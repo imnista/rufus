@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Localization functions, a.k.a. "Everybody is doing it wrong but me!"
- * Copyright © 2013-2014 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2016 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -30,12 +30,10 @@
 
 // Attributes that can be set by a translation
 #define LOC_RIGHT_TO_LEFT       0x00000001
-#define LOC_ARABIC_NUMERALS     0x00000002
-#define LOC_JAPANESE_NUMERALS   0x00000004
+#define LOC_NEEDS_UPDATE        0x00000002
 
-// The [v]ersion major from a translation must match this number or
-// the translation will be ignored
-#define LOC_FRAMEWORK_VERSION  1
+#define MSG_RTF                 0x10000000
+#define MSG_MASK                0x0FFFFFFF
 
 #define luprint(msg) uprintf("%s(%d): " msg "\n", loc_filename, loc_line_nr)
 #define luprintf(msg, ...) uprintf("%s(%d): " msg "\n", loc_filename, loc_line_nr, __VA_ARGS__)
@@ -111,8 +109,6 @@ static __inline void list_del(struct list_head *entry)
 // The last command with a control ID *MUST* be LC_TEXT
 enum loc_command_type {
 	LC_GROUP,
-	LC_MOVE,
-	LC_SIZE,
 	LC_TEXT,	// Delimits commands that take a Control ID and commands that don't
 	LC_VERSION,
 	LC_LOCALE,
@@ -149,7 +145,7 @@ typedef struct loc_dlg_list_struct {
 	struct list_head list;
 } loc_dlg_list;
 
-extern const loc_parse parse_cmd[9];
+extern const loc_parse parse_cmd[7];
 extern struct list_head locale_list;
 extern char *default_msg_table[], *current_msg_table[], **msg_table;
 int loc_line_nr;
@@ -166,7 +162,7 @@ void _exit_localization(BOOL reinit);
 void apply_localization(int dlg_id, HWND hDlg);
 void reset_localization(int dlg_id);
 void free_dialog_list(void);
-char* lmprintf(int msg_id, ...);
+char* lmprintf(uint32_t msg_id, ...);
 BOOL get_supported_locales(const char* filename);
 BOOL get_loc_data_file(const char* filename, loc_cmd* lcmd);
 void free_locale_list(void);
@@ -174,3 +170,4 @@ loc_cmd* get_locale_from_lcid(int lcid, BOOL fallback);
 loc_cmd* get_locale_from_name(char* locale_name, BOOL fallback);
 void toggle_default_locale(void);
 const char* get_name_from_id(int id);
+WORD get_language_id(loc_cmd* lcmd);

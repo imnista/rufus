@@ -26,6 +26,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
 #include "rufus.h"
 
@@ -214,7 +215,7 @@ static int fd_get_kbdrv(const char* kb)
 	return -1;
 }
 
-/* 
+/*
  * We display human readable descriptions of the locale in the menu
  * As real estate might be limited, keep it short
  */
@@ -288,8 +289,8 @@ static const char* kb_to_hr(const char* kb)
 		}
 	}
 	// Should never happen, so let's try to get some attention here
-	MessageBoxA(hMainDialog, "YO BNLA #1", "UHAHAHHA?", MB_OKCANCEL|MB_ICONWARNING);
-	return "Someone missed a keyboard!";
+	assert(i < ARRAYSIZE(kb_hr_list));
+	return NULL;
 }
 
 typedef struct {
@@ -304,7 +305,11 @@ static cp_list cp_hr_list[] = {
 	{ 437, "US-English"},
 	{ 667, "Polish"},
 	{ 668, "Polish (Alt)"},
-	{ 737, "Greek (ex-437G)"},
+	{ 708, "Arabic (708)"},
+	{ 709, "Arabic (709)"},
+	{ 710, "Arabic (710)"},
+	{ 720, "Arabic (DOS)"},
+	{ 737, "Greek (DOS)"},
 	{ 770, "Baltic"},
 	{ 771, "Cyr-Russian (KBL)"},
 	{ 772, "Cyr-Russian"},
@@ -421,8 +426,8 @@ static const char* cp_to_hr(ULONG cp)
 		}
 	}
 	// Should never happen, so this oughta get some attention
-	MessageBoxA(hMainDialog, "YO BNLA #2", "UHAHAHHA?", MB_OKCANCEL|MB_ICONWARNING);
-	return "Someone missed a codepage!";
+	assert(i < ARRAYSIZE(cp_hr_list));
+	return NULL;
 }
 
 // http://blogs.msdn.com/b/michkap/archive/2004/12/05/275231.aspx
@@ -756,7 +761,7 @@ static const char* get_kb(void)
  *		0x035C	860 (Portuguese)
  *		0x035F	863 (French Canadian)
  *		0x0361	865 (Nordic)
- *	
+ *
  *	EGA2.CPI:
  *		0x0352	850 (Latin 1)
  *		0x0354	852 (Latin 2)
@@ -764,7 +769,7 @@ static const char* get_kb(void)
  *		0x035D	861 (Icelandic)
  *		0x0365	869 (Greek)
  *		0x02E1	737 (Greek II)
- *	
+ *
  *	EGA3.CPI:
  *		0x01B5	437 (United States)
  *		0x0307	775 (Baltic)
@@ -785,7 +790,7 @@ static const char* ms_get_ega(ULONG cp)
 	case   860: // Portuguese
 	case   863: // French Canadian
 	case   865: // Nordic
-		return "ega.cpi"; 
+		return "ega.cpi";
 
 //	case   850: // Latin-1 (Western European)
 //	case   852: // Latin-2 (Central European)
@@ -805,7 +810,7 @@ static const char* ms_get_ega(ULONG cp)
 
 	default:
 		return NULL;
-	}	
+	}
 }
 
 // Pick the EGA to use according to the DOS target codepage (from CPIDOS' Codepage.txt)
@@ -816,9 +821,9 @@ static const char* fd_get_ega(ULONG cp)
 	case   850: // Latin-1 (Western European)
 	case   852: // Latin-2 (Central European)
 	case   853: // Latin-3 (Southern European)
-	case   857: // Latin-5 
+	case   857: // Latin-5
 	case   858: // Latin-1 with Euro
-		return "ega.cpx"; 
+		return "ega.cpx";
 	case   775: // Latin-7 (Baltic Rim)
 	case   859: // Latin-9
 	case  1116: // Estonian
@@ -988,8 +993,8 @@ BOOL SetDOSLocale(const char* path, BOOL bFreeDOS)
 
 	if ((cp == 437) && (strcmp(kb, "us") == 0)) {
 		// Nothing much to do if US/US - just notify in autoexec.bat
-		safe_strcpy(filename, sizeof(filename), path);
-		safe_strcat(filename, sizeof(filename), "\\AUTOEXEC.BAT");
+		static_strcpy(filename, path);
+		static_strcat(filename, "\\AUTOEXEC.BAT");
 		fd = fopen(filename, "w+");
 		if (fd == NULL) {
 			uprintf("Unable to create 'AUTOEXEC.BAT': %s.\n", WindowsErrorString());
@@ -1004,8 +1009,8 @@ BOOL SetDOSLocale(const char* path, BOOL bFreeDOS)
 	}
 
 	// CONFIG.SYS
-	safe_strcpy(filename, sizeof(filename), path);
-	safe_strcat(filename, sizeof(filename), "\\CONFIG.SYS");
+	static_strcpy(filename, path);
+	static_strcat(filename, "\\CONFIG.SYS");
 	fd = fopen(filename, "w+");
 	if (fd == NULL) {
 		uprintf("Unable to create 'CONFIG.SYS': %s.\n", WindowsErrorString());
@@ -1029,8 +1034,8 @@ BOOL SetDOSLocale(const char* path, BOOL bFreeDOS)
 	uprintf("Successfully wrote 'CONFIG.SYS'\n");
 
 	// AUTOEXEC.BAT
-	safe_strcpy(filename, sizeof(filename), path);
-	safe_strcat(filename, sizeof(filename), "\\AUTOEXEC.BAT");
+	static_strcpy(filename, path);
+	static_strcat(filename, "\\AUTOEXEC.BAT");
 	fd = fopen(filename, "w+");
 	if (fd == NULL) {
 		uprintf("Unable to create 'AUTOEXEC.BAT': %s.\n", WindowsErrorString());

@@ -1,7 +1,7 @@
 /*
- * Library header for busybox
+ * Library header for busybox/Bled
  *
- * Rewritten for Bled (Busybox Library for Easy Decompression)
+ * Rewritten for Bled (Base Library for Easy Decompression)
  * Copyright © 2014-2015 Pete Batard <pete@akeo.ie>
  *
  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
@@ -18,19 +18,6 @@
 
 #ifndef _WIN32
 #error Only Windows platforms are supported
-#endif
-
-#if defined(_MSC_VER)
-#pragma warning(disable: 4715)		// not all control paths return a value
-#pragma warning(disable: 4996)		// Ignore deprecated
-#if defined(DDKBUILD)
-#pragma warning(disable: 4242)		// "Conversion from x to y, possible loss of data"
-#pragma warning(disable: 4244)
-struct timeval {
-	long tv_sec;
-	long tv_usec;
-};
-#endif
 #endif
 
 #include "platform.h"
@@ -140,9 +127,9 @@ extern unsigned long* bled_cancel_request;
 #define xfunc_die() longjmp(bb_error_jmp, 1)
 #define bb_printf(...) do { if (bled_printf != NULL) bled_printf(__VA_ARGS__); \
 	else { printf(__VA_ARGS__); putchar('\n'); } } while(0)
-#define bb_error_msg bb_printf
-#define bb_error_msg_and_die(...) do {bb_printf(__VA_ARGS__); xfunc_die();} while(0)
-#define bb_error_msg_and_err(...) do {bb_printf(__VA_ARGS__); goto err;} while(0)
+#define bb_error_msg(...) bb_printf("Error: " __VA_ARGS__)
+#define bb_error_msg_and_die(...) do {bb_error_msg(__VA_ARGS__); xfunc_die();} while(0)
+#define bb_error_msg_and_err(...) do {bb_error_msg(__VA_ARGS__); goto err;} while(0)
 #define bb_perror_msg bb_error_msg
 #define bb_perror_msg_and_die bb_error_msg_and_die
 #define bb_putchar putchar
@@ -157,7 +144,7 @@ static inline void *xrealloc(void *ptr, size_t size) {
 #define bb_msg_read_error "read error"
 #define bb_msg_write_error "write error"
 #define bb_mode_string(mode) "[not implemented]"
-#define bb_copyfd_exact_size(fd1, fd2, size) bb_printf("not implemented")
+#define bb_copyfd_exact_size(fd1, fd2, size) bb_error_msg("Not implemented")
 #define bb_make_directory(path, mode, flags) SHCreateDirectoryExU(NULL, path, NULL)
 
 static inline int link(const char *oldpath, const char *newpath) {errno = ENOSYS; return -1;}
@@ -197,7 +184,8 @@ static inline int full_read(int fd, void *buf, size_t count) {
 }
 
 static inline struct tm *localtime_r(const time_t *timep, struct tm *result) {
-	result = localtime(timep);
+	if (localtime_s(result, timep) != 0)
+		result = NULL;
 	return result;
 }
 

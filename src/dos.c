@@ -2,8 +2,8 @@
  * Rufus: The Reliable USB Formatting Utility
  * DOS boot file extraction, from the FAT12 floppy image in diskcopy.dll
  * (MS WinME DOS) or from the embedded FreeDOS resource files
- * Copyright © 2011-2015 Pete Batard <pete@akeo.ie>
- * 
+ * Copyright © 2011-2017 Pete Batard <pete@akeo.ie>
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -31,8 +31,10 @@
 #include <string.h>
 
 #include "rufus.h"
-#include "dos.h"
+#include "missing.h"
 #include "resource.h"
+
+#include "dos.h"
 
 static BYTE* DiskImage = NULL;
 static DWORD DiskImageSize;
@@ -69,10 +71,6 @@ typedef struct _TIME_FIELDS {
 #define ARGUMENT_PRESENT(ArgumentPointer) \
 	((CHAR*)((ULONG_PTR)(ArgumentPointer)) != (CHAR*)NULL)
 
-static const int YearLengths[2] =
-{
-	DAYSPERNORMALYEAR, DAYSPERLEAPYEAR
-};
 static const UCHAR MonthLengths[2][MONSPERYEAR] =
 {
 	{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 },
@@ -250,15 +248,15 @@ static BOOL ExtractFAT(int entry, const char* path)
 	}
 
 	/* Create a file, using the same attributes as found in the FAT */
-	hFile = CreateFileA(filename, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE,
+	hFile = CreateFileA(filename, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ,
 		NULL, CREATE_ALWAYS, dir_entry->Attributes, NULL);
 	if (hFile == INVALID_HANDLE_VALUE) {
 		uprintf("Unable to create file '%s': %s.\n", filename, WindowsErrorString());
 		return FALSE;
 	}
 
-	if ((!WriteFile(hFile, &DiskImage[filestart], (DWORD)filesize, &Size, 0)) || (filesize != Size)) {
-		uprintf("Couldn't write file '%s': %s.\n", filename, WindowsErrorString());
+	if (!WriteFileWithRetry(hFile, &DiskImage[filestart], (DWORD)filesize, &Size, WRITE_RETRIES)) {
+		uprintf("Could not write file '%s': %s.\n", filename, WindowsErrorString());
 		safe_closehandle(hFile);
 		return FALSE;
 	}
@@ -299,9 +297,12 @@ static BOOL ExtractMSDOS(const char* path)
 		"KEYB    COM", "KEYBOARDSYS", "KEYBRD2 SYS", "KEYBRD3 SYS", "KEYBRD4 SYS",
 		"DISPLAY SYS", "EGA     CPI", "EGA2    CPI", "EGA3    CPI" };
 
+	if (path == NULL)
+		return FALSE;
+
 	// Reduce the visible mess by placing all the locale files into a subdir
-	safe_strcpy(locale_path, sizeof(locale_path), path);
-	safe_strcat(locale_path, sizeof(locale_path), "LOCALE\\");
+	static_strcpy(locale_path, path);
+	static_strcat(locale_path, "LOCALE\\");
 	CreateDirectoryA(locale_path, NULL);
 
 	len = GetSystemDirectoryA(dllname, sizeof(dllname));
@@ -309,7 +310,7 @@ static BOOL ExtractMSDOS(const char* path)
 		uprintf("Unable to get system directory: %s\n", WindowsErrorString());
 		goto out;
 	}
-	safe_strcat(dllname, sizeof(dllname), "\\diskcopy.dll");
+	static_strcat(dllname, "\\diskcopy.dll");
 	hDLL = LoadLibraryA(dllname);
 	if (hDLL == NULL) {
 		uprintf("Unable to open %s: %s\n", dllname, WindowsErrorString());
@@ -321,7 +322,7 @@ static BOOL ExtractMSDOS(const char* path)
 		goto out;
 
 	// Sanity check
-	if (DiskImageSize < 700*1024) {
+	if (DiskImageSize < 700*KB) {
 		uprintf("MS-DOS disk image is too small (%d bytes)\n", dllname, DiskImageSize);
 		goto out;
 	}
@@ -351,11 +352,11 @@ out:
 BOOL ExtractFreeDOS(const char* path)
 {
 	const char* res_name[] = { "COMMAND.COM", "KERNEL.SYS", "DISPLAY.EXE", "KEYB.EXE",
-		"MODE.COM", "KEYBOARD.SYS", "KEYBRD2.SYS", "KEYBRD3.SYS", "KEYBRD4.SYS", "ega.cpx",
-		"ega2.cpx", "ega3.cpx", "ega4.cpx", "ega5.cpx", "ega6.cpx",
-		"ega7.cpx", "ega8.cpx", "ega9.cpx", "ega10.cpx", "ega11.cpx",
-		"ega12.cpx", "ega13.cpx", "ega14.cpx", "ega15.cpx", "ega16.cpx",
-		"ega17.cpx", "ega18.cpx" };
+		"MODE.COM", "KEYBOARD.SYS", "KEYBRD2.SYS", "KEYBRD3.SYS", "KEYBRD4.SYS", "EGA.CPX",
+		"EGA2.CPX", "EGA3.CPX", "EGA4.CPX", "EGA5.CPX", "EGA6.CPX",
+		"EGA7.CPX", "EGA8.CPX", "EGA9.CPX", "EGA10.CPX", "EGA11.CPX",
+		"EGA12.CPX", "EGA13.CPX", "EGA14.CPX", "EGA15.CPX", "EGA16.CPX",
+		"EGA17.CPX", "EGA18.CPX" };
 	const int res_id[ARRAYSIZE(res_name)] = { IDR_FD_COMMAND_COM, IDR_FD_KERNEL_SYS, IDR_FD_DISPLAY_EXE, IDR_FD_KEYB_EXE,
 		IDR_FD_MODE_COM, IDR_FD_KB1_SYS, IDR_FD_KB2_SYS, IDR_FD_KB3_SYS, IDR_FD_KB4_SYS, IDR_FD_EGA1_CPX,
 		IDR_FD_EGA2_CPX, IDR_FD_EGA3_CPX, IDR_FD_EGA4_CPX, IDR_FD_EGA5_CPX, IDR_FD_EGA6_CPX,
@@ -374,25 +375,25 @@ BOOL ExtractFreeDOS(const char* path)
 	}
 
 	// Reduce the visible mess by placing all the locale files into a subdir
-	safe_strcpy(locale_path, sizeof(locale_path), path);
-	safe_strcat(locale_path, sizeof(locale_path), "LOCALE\\");
+	static_strcpy(locale_path, path);
+	static_strcat(locale_path, "LOCALE\\");
 	CreateDirectoryA(locale_path, NULL);
 
 	for (i=0; i<ARRAYSIZE(res_name); i++) {
 		res_data = (BYTE*)GetResource(hMainInstance, MAKEINTRESOURCEA(res_id[i]), _RT_RCDATA, res_name[i], &res_size, FALSE);
 
-		safe_strcpy(filename, sizeof(filename), ((i<2)?path:locale_path));
-		safe_strcat(filename, sizeof(filename), res_name[i]);
+		static_strcpy(filename, ((i<2)?path:locale_path));
+		static_strcat(filename, res_name[i]);
 
-		hFile = CreateFileA(filename, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+		hFile = CreateFileA(filename, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ, NULL,
 			CREATE_ALWAYS, (i<2)?(FILE_ATTRIBUTE_HIDDEN|FILE_ATTRIBUTE_SYSTEM):FILE_ATTRIBUTE_NORMAL, NULL);
-		if (hFile == INVALID_HANDLE_VALUE) {
+		if ((hFile == NULL) || (hFile == INVALID_HANDLE_VALUE)) {
 			uprintf("Unable to create file '%s': %s.\n", filename, WindowsErrorString());
 			return FALSE;
 		}
 
-		if ((!WriteFile(hFile, res_data, res_size, &Size, 0)) || (res_size != Size)) {
-			uprintf("Couldn't write file '%s': %s.\n", filename, WindowsErrorString());
+		if (!WriteFileWithRetry(hFile, res_data, res_size, &Size, WRITE_RETRIES)) {
+			uprintf("Could not write file '%s': %s.\n", filename, WindowsErrorString());
 			safe_closehandle(hFile);
 			return FALSE;
 		}

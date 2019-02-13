@@ -88,20 +88,21 @@ CONFIG_CLEAN_FILES =
 CONFIG_CLEAN_VPATH_FILES =
 PROGRAMS = $(noinst_PROGRAMS)
 am_rufus_OBJECTS = rufus-badblocks.$(OBJEXT) rufus-checksum.$(OBJEXT) \
-	rufus-dos.$(OBJEXT) rufus-dos_locale.$(OBJEXT) \
-	rufus-drive.$(OBJEXT) rufus-format.$(OBJEXT) \
-	rufus-icon.$(OBJEXT) rufus-iso.$(OBJEXT) \
-	rufus-localization.$(OBJEXT) rufus-net.$(OBJEXT) \
+	rufus-dev.$(OBJEXT) rufus-dos.$(OBJEXT) \
+	rufus-dos_locale.$(OBJEXT) rufus-drive.$(OBJEXT) \
+	rufus-format.$(OBJEXT) rufus-icon.$(OBJEXT) \
+	rufus-iso.$(OBJEXT) rufus-localization.$(OBJEXT) \
+	rufus-net.$(OBJEXT) rufus-parser.$(OBJEXT) rufus-pki.$(OBJEXT) \
+	rufus-process.$(OBJEXT) rufus-rufus.$(OBJEXT) \
 	rufus-smart.$(OBJEXT) rufus-stdfn.$(OBJEXT) \
 	rufus-stdio.$(OBJEXT) rufus-stdlg.$(OBJEXT) \
-	rufus-rufus.$(OBJEXT) rufus-parser.$(OBJEXT) \
-	rufus-syslinux.$(OBJEXT) rufus-usb.$(OBJEXT) \
+	rufus-syslinux.$(OBJEXT) rufus-ui.$(OBJEXT) \
 	rufus-vhd.$(OBJEXT)
 rufus_OBJECTS = $(am_rufus_OBJECTS)
 rufus_DEPENDENCIES = rufus_rc.o bled/libbled.a ms-sys/libmssys.a \
 	syslinux/libfat/libfat.a syslinux/libinstaller/libinstaller.a \
-	libcdio/iso9660/libiso9660.a libcdio/udf/libudf.a \
-	libcdio/driver/libdriver.a
+	syslinux/win/libwin.a libcdio/iso9660/libiso9660.a \
+	libcdio/udf/libudf.a libcdio/driver/libdriver.a
 rufus_LINK = $(CCLD) $(rufus_CFLAGS) $(CFLAGS) $(rufus_LDFLAGS) \
 	$(LDFLAGS) -o $@
 AM_V_P = $(am__v_P_@AM_V@)
@@ -265,18 +266,18 @@ target_alias = @target_alias@
 top_build_prefix = @top_build_prefix@
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
-SUBDIRS = bled ms-sys syslinux/libfat syslinux/libinstaller libcdio/iso9660 libcdio/udf libcdio/driver ../res/localization
+SUBDIRS = bled ms-sys syslinux/libfat syslinux/libinstaller syslinux/win libcdio/iso9660 libcdio/udf libcdio/driver ../res/loc
 AM_V_WINDRES_0 = @echo "  RC     $@";$(WINDRES)
 AM_V_WINDRES_1 = $(WINDRES)
 AM_V_WINDRES_ = $(AM_V_WINDRES_$(AM_DEFAULT_VERBOSITY))
 AM_V_WINDRES = $(AM_V_WINDRES_$(V))
-rufus_SOURCES = badblocks.c checksum.c dos.c dos_locale.c drive.c format.c icon.c iso.c localization.c net.c smart.c \
-  stdfn.c stdio.c stdlg.c rufus.c parser.c syslinux.c usb.c vhd.c
+rufus_SOURCES = badblocks.c checksum.c dev.c dos.c dos_locale.c drive.c format.c icon.c iso.c localization.c \
+	net.c parser.c pki.c process.c rufus.c smart.c stdfn.c stdio.c stdlg.c syslinux.c ui.c vhd.c
 
-rufus_CFLAGS = -I./ms-sys/inc -I./syslinux/libfat -I./syslinux/libinstaller -I./libcdio $(AM_CFLAGS)
+rufus_CFLAGS = -I./ms-sys/inc -I./syslinux/libfat -I./syslinux/libinstaller -I./syslinux/win -I./libcdio $(AM_CFLAGS)
 rufus_LDFLAGS = $(AM_LDFLAGS) -mwindows
-rufus_LDADD = rufus_rc.o bled/libbled.a ms-sys/libmssys.a syslinux/libfat/libfat.a syslinux/libinstaller/libinstaller.a \
-	libcdio/iso9660/libiso9660.a libcdio/udf/libudf.a libcdio/driver/libdriver.a -lsetupapi -lole32 -lgdi32 -lwininet -lshlwapi
+rufus_LDADD = rufus_rc.o bled/libbled.a ms-sys/libmssys.a syslinux/libfat/libfat.a syslinux/libinstaller/libinstaller.a syslinux/win/libwin.a \
+	libcdio/iso9660/libiso9660.a libcdio/udf/libudf.a libcdio/driver/libdriver.a -lsetupapi -lole32 -lgdi32 -lshlwapi -lcrypt32 -lwintrust -lcomdlg32 -lcomctl32 -luuid -lpsapi
 
 all: all-recursive
 
@@ -344,6 +345,12 @@ rufus-checksum.o: checksum.c
 rufus-checksum.obj: checksum.c
 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-checksum.obj `if test -f 'checksum.c'; then $(CYGPATH_W) 'checksum.c'; else $(CYGPATH_W) '$(srcdir)/checksum.c'; fi`
 
+rufus-dev.o: dev.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-dev.o `test -f 'dev.c' || echo '$(srcdir)/'`dev.c
+
+rufus-dev.obj: dev.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-dev.obj `if test -f 'dev.c'; then $(CYGPATH_W) 'dev.c'; else $(CYGPATH_W) '$(srcdir)/dev.c'; fi`
+
 rufus-dos.o: dos.c
 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-dos.o `test -f 'dos.c' || echo '$(srcdir)/'`dos.c
 
@@ -392,6 +399,30 @@ rufus-net.o: net.c
 rufus-net.obj: net.c
 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-net.obj `if test -f 'net.c'; then $(CYGPATH_W) 'net.c'; else $(CYGPATH_W) '$(srcdir)/net.c'; fi`
 
+rufus-parser.o: parser.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-parser.o `test -f 'parser.c' || echo '$(srcdir)/'`parser.c
+
+rufus-parser.obj: parser.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-parser.obj `if test -f 'parser.c'; then $(CYGPATH_W) 'parser.c'; else $(CYGPATH_W) '$(srcdir)/parser.c'; fi`
+
+rufus-pki.o: pki.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-pki.o `test -f 'pki.c' || echo '$(srcdir)/'`pki.c
+
+rufus-pki.obj: pki.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-pki.obj `if test -f 'pki.c'; then $(CYGPATH_W) 'pki.c'; else $(CYGPATH_W) '$(srcdir)/pki.c'; fi`
+
+rufus-process.o: process.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-process.o `test -f 'process.c' || echo '$(srcdir)/'`process.c
+
+rufus-process.obj: process.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-process.obj `if test -f 'process.c'; then $(CYGPATH_W) 'process.c'; else $(CYGPATH_W) '$(srcdir)/process.c'; fi`
+
+rufus-rufus.o: rufus.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-rufus.o `test -f 'rufus.c' || echo '$(srcdir)/'`rufus.c
+
+rufus-rufus.obj: rufus.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-rufus.obj `if test -f 'rufus.c'; then $(CYGPATH_W) 'rufus.c'; else $(CYGPATH_W) '$(srcdir)/rufus.c'; fi`
+
 rufus-smart.o: smart.c
 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-smart.o `test -f 'smart.c' || echo '$(srcdir)/'`smart.c
 
@@ -416,29 +447,17 @@ rufus-stdlg.o: stdlg.c
 rufus-stdlg.obj: stdlg.c
 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-stdlg.obj `if test -f 'stdlg.c'; then $(CYGPATH_W) 'stdlg.c'; else $(CYGPATH_W) '$(srcdir)/stdlg.c'; fi`
 
-rufus-rufus.o: rufus.c
-	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-rufus.o `test -f 'rufus.c' || echo '$(srcdir)/'`rufus.c
-
-rufus-rufus.obj: rufus.c
-	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-rufus.obj `if test -f 'rufus.c'; then $(CYGPATH_W) 'rufus.c'; else $(CYGPATH_W) '$(srcdir)/rufus.c'; fi`
-
-rufus-parser.o: parser.c
-	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-parser.o `test -f 'parser.c' || echo '$(srcdir)/'`parser.c
-
-rufus-parser.obj: parser.c
-	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-parser.obj `if test -f 'parser.c'; then $(CYGPATH_W) 'parser.c'; else $(CYGPATH_W) '$(srcdir)/parser.c'; fi`
-
 rufus-syslinux.o: syslinux.c
 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-syslinux.o `test -f 'syslinux.c' || echo '$(srcdir)/'`syslinux.c
 
 rufus-syslinux.obj: syslinux.c
 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-syslinux.obj `if test -f 'syslinux.c'; then $(CYGPATH_W) 'syslinux.c'; else $(CYGPATH_W) '$(srcdir)/syslinux.c'; fi`
 
-rufus-usb.o: usb.c
-	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-usb.o `test -f 'usb.c' || echo '$(srcdir)/'`usb.c
+rufus-ui.o: ui.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-ui.o `test -f 'ui.c' || echo '$(srcdir)/'`ui.c
 
-rufus-usb.obj: usb.c
-	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-usb.obj `if test -f 'usb.c'; then $(CYGPATH_W) 'usb.c'; else $(CYGPATH_W) '$(srcdir)/usb.c'; fi`
+rufus-ui.obj: ui.c
+	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-ui.obj `if test -f 'ui.c'; then $(CYGPATH_W) 'ui.c'; else $(CYGPATH_W) '$(srcdir)/ui.c'; fi`
 
 rufus-vhd.o: vhd.c
 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(rufus_CFLAGS) $(CFLAGS) -c -o rufus-vhd.o `test -f 'vhd.c' || echo '$(srcdir)/'`vhd.c
@@ -663,7 +682,7 @@ uninstall-am:
 	uninstall-am
 
 
-%_rc.o: %.rc ../res/localization/embedded.loc
+%_rc.o: %.rc ../res/loc/embedded.loc
 	$(AM_V_WINDRES) $(AM_RCFLAGS) -i $< -o $@
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.

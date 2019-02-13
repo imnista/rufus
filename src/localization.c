@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Localization functions, a.k.a. "Everybody is doing it wrong but me!"
- * Copyright © 2013-2015 Pete Batard <pete@akeo.ie>
+ * Copyright © 2013-2017 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@
 #endif
 
 #include <windows.h>
+#include <windowsx.h>
 #include <stdio.h>
 #include <wchar.h>
 #include <string.h>
@@ -35,7 +36,7 @@
 #include "localization.h"
 #include "localization_data.h"
 
-/* 
+/*
  * List of supported locale commands, with their parameter syntax:
  *   c control ID (no space, no quotes)
  *   s: quoted string
@@ -43,7 +44,7 @@
  *   u: 32 bit unsigned CSV list
  * Remember to update the size of the array in localization.h when adding/removing elements
  */
-const loc_parse parse_cmd[9] = {
+const loc_parse parse_cmd[7] = {
 	// Translation name and Windows LCIDs it should apply to
 	{ 'l', LC_LOCALE, "ssu" },	// l "en_US" "English (US)" 0x0009,0x1009
 	// Base translation to add on top of (eg. "English (UK)" can be used to build on top of "English (US)"
@@ -54,10 +55,6 @@ const loc_parse parse_cmd[9] = {
 	{ 't', LC_TEXT, "cs" },		// t IDC_CONTROL "Translation"
 	// Set the section/dialog to which the next commands should apply
 	{ 'g', LC_GROUP, "c" },		// g IDD_DIALOG
-	// Resize a dialog (dx dy pixel increment)
-	{ 's', LC_SIZE, "cii" },	// s IDC_CONTROL +10 +10
-	// Move a dialog (dx dy pixed displacement)
-	{ 'm', LC_MOVE, "cii" },	// m IDC_CONTROL -5 0
 	// Set the font to use for the text controls that follow
 	// Use f "Default" 0 to reset the font
 	{ 'f', LC_FONT, "si" },		// f "MS Dialog" 10
@@ -137,7 +134,7 @@ void add_message_command(loc_cmd* lcmd)
 		uprintf("localization: invalid MSG_ index\n");
 		return;
 	}
-	
+
 	safe_free(msg_table[lcmd->ctrl_id-MSG_000]);
 	msg_table[lcmd->ctrl_id-MSG_000] = lcmd->txt[1];
 	lcmd->txt[1] = NULL;	// String would be freed after this call otherwise
@@ -258,8 +255,6 @@ BOOL dispatch_loc_cmd(loc_cmd* lcmd)
 	switch(lcmd->command) {
 	// NB: For commands that take an ID, ctrl_id is always a valid index at this stage
 	case LC_TEXT:
-	case LC_MOVE:
-	case LC_SIZE:
 		add_dialog_command(dlg_index, lcmd);
 		break;
 	case LC_GROUP:
@@ -343,16 +338,6 @@ void apply_localization(int dlg_id, HWND hDlg)
 						SetWindowTextU(hCtrl, lcmd->txt[1]);
 				}
 				break;
-			case LC_MOVE:
-				if (hCtrl != NULL) {
-					ResizeMoveCtrl(hDlg, hCtrl, lcmd->num[0], lcmd->num[1], 0, 0);
-				}
-				break;
-			case LC_SIZE:
-				if (hCtrl != NULL) {
-					ResizeMoveCtrl(hDlg, hCtrl, 0, 0, lcmd->num[0], lcmd->num[1]);
-				}
-				break;
 			}
 		}
 	}
@@ -375,25 +360,42 @@ void reset_localization(int dlg_id)
  * Uses a rolling list of buffers to allow concurrency
  * TODO: use dynamic realloc'd buffer in case LOC_MESSAGE_SIZE is not enough
  */
-char* lmprintf(int msg_id, ...)
+char* lmprintf(uint32_t msg_id, ...)
 {
 	static int buf_id = 0;
 	static char buf[LOC_MESSAGE_NB][LOC_MESSAGE_SIZE];
 	char *format = NULL;
+	size_t pos = 0;
 	va_list args;
+	BOOL is_rtf = (msg_id & MSG_RTF);
+
 	buf_id %= LOC_MESSAGE_NB;
 	buf[buf_id][0] = 0;
 
-	if ((msg_id > MSG_000) && (msg_id < MSG_MAX)) {
+	msg_id &= MSG_MASK;
+	if ((msg_id >= MSG_000) && (msg_id < MSG_MAX)) {
 		format = msg_table[msg_id - MSG_000];
 	}
 
 	if (format == NULL) {
 		safe_sprintf(buf[buf_id], LOC_MESSAGE_SIZE-1, "MSG_%03d UNTRANSLATED", msg_id - MSG_000);
 	} else {
+		if (right_to_left_mode && (msg_table != default_msg_table)) {
+			if (is_rtf) {
+				safe_strcpy(&buf[buf_id][pos], LOC_MESSAGE_SIZE - 1, "\\rtlch");
+				pos += 6;
+			}
+			safe_strcpy(&buf[buf_id][pos], LOC_MESSAGE_SIZE - 1, RIGHT_TO_LEFT_EMBEDDING);
+			pos += sizeof(RIGHT_TO_LEFT_EMBEDDING) - 1;
+		}
 		va_start(args, msg_id);
-		safe_vsnprintf(buf[buf_id], LOC_MESSAGE_SIZE-1, format, args);
+		safe_vsnprintf(&buf[buf_id][pos], LOC_MESSAGE_SIZE- 1 - 2*pos, format, args);
 		va_end(args);
+		if (right_to_left_mode && (msg_table != default_msg_table)) {
+			safe_strcat(buf[buf_id], LOC_MESSAGE_SIZE - 1, POP_DIRECTIONAL_FORMATTING);
+			if (is_rtf)
+				safe_strcat(buf[buf_id], LOC_MESSAGE_SIZE - 1, "\\ltrch");
+		}
 		buf[buf_id][LOC_MESSAGE_SIZE-1] = '\0';
 	}
 	return buf[buf_id++];
@@ -413,14 +415,56 @@ char* lmprintf(int msg_id, ...)
 #define MSG_HIGH_PRI 1
 char szMessage[2][2][MSG_LEN] = { {"", ""}, {"", ""} };
 char* szStatusMessage = szMessage[MSG_STATUS][MSG_HIGH_PRI];
-static BOOL bStatusTimerArmed = FALSE;
+static BOOL bStatusTimerArmed = FALSE, bOutputTimerArmed[2] = { FALSE, FALSE };
+static char *output_msg[2];
+static uint64_t last_msg_time[2] = { 0, 0 };
 
-static void __inline OutputMessage(BOOL info, char* msg)
+static void PrintInfoMessage(char* msg) {
+	SetWindowTextU(hProgress, msg);
+	InvalidateRect(hProgress, NULL, TRUE);
+}
+static void PrintStatusMessage(char* msg) {
+	SendMessageLU(hStatus, SB_SETTEXTW, SBT_OWNERDRAW | SB_SECTION_LEFT, msg);
+}
+typedef void PRINT_FUNCTION(char*);
+PRINT_FUNCTION *PrintMessage[2] = { PrintInfoMessage, PrintStatusMessage };
+
+/*
+ * The following timer call is used, along with MAX_REFRESH, to prevent obnoxious flicker
+ * on the Info and Status fields due to messages being updated too quickly.
+ */
+static void CALLBACK OutputMessageTimeout(HWND hWnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
 {
-	if (info)
-		SetWindowTextU(hInfo, msg);
-	else
-		SendMessageLU(hStatus, SB_SETTEXTW, SBT_OWNERDRAW | SB_SECTION_LEFT, msg);
+	int i = (idEvent == TID_OUTPUT_INFO)? 0 : 1;
+
+	KillTimer(hMainDialog, idEvent);
+	bOutputTimerArmed[i] = FALSE;
+
+	PrintMessage[i](output_msg[i]);
+	last_msg_time[i] = GetTickCount64();
+}
+
+static void OutputMessage(BOOL info, char* msg)
+{
+	uint64_t delta;
+	int i = info ? 0 : 1;
+
+	if (bOutputTimerArmed[i]) {
+		// Already have a delayed message going - just change that message to latest
+		output_msg[i] = msg;
+	} else {
+		// Find if we need to arm a timer
+		delta = GetTickCount64() - last_msg_time[i];
+		if (delta < (2 * MAX_REFRESH)) {
+			// Not enough time has elapsed since our last output => arm a timer
+			output_msg[i] = msg;
+			SetTimer(hMainDialog, TID_OUTPUT_INFO + i, (UINT)((2 * MAX_REFRESH) - delta), OutputMessageTimeout);
+			bOutputTimerArmed[i] = TRUE;
+		} else {
+			PrintMessage[i](msg);
+			last_msg_time[i] = GetTickCount64();
+		}
+	}
 }
 
 static void CALLBACK PrintMessageTimeout(HWND hWnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
@@ -457,7 +501,8 @@ void PrintStatusInfo(BOOL info, BOOL debug, unsigned int duration, int msg_id, .
 	if (!info)
 		szStatusMessage = szMessage[MSG_STATUS][(duration > 0)?MSG_LOW_PRI:MSG_HIGH_PRI];
 
-	format = msg_table[msg_id - MSG_000];
+	if ((msg_id >= MSG_000) && (msg_id < MSG_MAX))
+		format = msg_table[msg_id - MSG_000];
 	if (format == NULL) {
 		safe_sprintf(msg_hi, MSG_LEN, "MSG_%03d UNTRANSLATED", msg_id - MSG_000);
 		uprintf(msg_hi);
@@ -480,7 +525,8 @@ void PrintStatusInfo(BOOL info, BOOL debug, unsigned int duration, int msg_id, .
 
 	// Because we want the log messages in English, we go through the VA business once more, but this time with default_msg_table
 	if (debug) {
-		format = default_msg_table[msg_id - MSG_000];
+		if ((msg_id >= MSG_000) && (msg_id < MSG_MAX))
+			format = default_msg_table[msg_id - MSG_000];
 		if (format == NULL) {
 			safe_sprintf(buf, sizeof(szStatusMessage), "(default) MSG_%03d UNTRANSLATED", msg_id - MSG_000);
 			return;
@@ -547,7 +593,7 @@ loc_cmd* get_locale_from_name(char* locale_name, BOOL fallback)
 	return lcmd;
 }
 
-/* 
+/*
  * This call is used to toggle the issuing of messages with the default locale
  * (usually en-US) instead of the current (usually non en) one.
  */
@@ -572,4 +618,55 @@ const char* get_name_from_id(int id)
 			return control_id[i].name;
 	}
 	return "UNKNOWN ID";
+}
+
+/*
+ * This call is used to get a supported Windows Language identifier we
+ * should pass to MessageBoxEx to try to get the buttons displayed in
+ * the currently selected language. This relies on the relevant language
+ * pack having been installed.
+ */
+static BOOL found_lang;
+static BOOL CALLBACK EnumUILanguagesProc(LPTSTR lpUILanguageString, LONG_PTR lParam)
+{
+	wchar_t* wlang = (wchar_t*)lParam;
+	if (wcscmp(wlang, lpUILanguageString) == 0)
+		found_lang = TRUE;
+	return TRUE;
+}
+
+WORD get_language_id(loc_cmd* lcmd)
+{
+	int i;
+	wchar_t wlang[5];
+	LANGID lang_id = GetUserDefaultUILanguage();
+
+	if (lcmd == NULL)
+		return MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT);
+
+	// Find if the selected language is the user default
+	for (i = 0; i<lcmd->unum_size; i++) {
+		if (lcmd->unum[i] == lang_id) {
+			ubprintf("Will use default UI locale 0x%04X", lang_id);
+			return MAKELANGID(lang_id, SUBLANG_DEFAULT);
+		}
+	}
+
+	// Selected language is not user default - find if a language pack is installed for it
+	found_lang = FALSE;
+	for (i = 0; (i<lcmd->unum_size); i++) {
+		// Always uppercase
+		_snwprintf(wlang, ARRAYSIZE(wlang), L"%04X", lcmd->unum[i]);
+		// This callback enumeration from Microsoft is retarded. Now we need a global
+		// boolean to tell us that we found what we were after.
+		EnumUILanguages(EnumUILanguagesProc, 0x4, (LONG_PTR)wlang);	// 0x04 = MUI_LANGUAGE_ID
+		if (found_lang) {
+			ubprintf("Detected installed Windows Language Pack for 0x%04X (%s)", lcmd->unum[i], lcmd->txt[1]);
+			return MAKELANGID(lcmd->unum[i], SUBLANG_DEFAULT);
+		}
+	}
+
+	ubprintf("NOTE: No Windows Language Pack is installed for %s on this system.\r\n"
+		"This means that some controls may still be displayed using the system locale.", lcmd->txt[1]);
+	return MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT);
 }

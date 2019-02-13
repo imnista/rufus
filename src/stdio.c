@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Standard User I/O Routines (logging, status, etc.)
- * Copyright © 2011-2015 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2017 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -29,21 +29,24 @@
 #include <ctype.h>
 #include <math.h>
 
-#include "msapi_utf8.h"
 #include "rufus.h"
 #include "resource.h"
+#include "msapi_utf8.h"
 #include "localization.h"
 
 /*
  * Globals
  */
 HWND hStatus;
+size_t ubuffer_pos = 0;
+char ubuffer[UBUFFER_SIZE];	// Buffer for ubpushf() messages we don't log right away
 
-#ifdef RUFUS_DEBUG
+#ifdef RUFUS_LOGGING
 void _uprintf(const char *format, ...)
 {
 	static char buf[4096];
 	char* p = buf;
+	wchar_t* wbuf;
 	va_list args;
 	int n;
 
@@ -60,17 +63,51 @@ void _uprintf(const char *format, ...)
 	*p++ = '\n';
 	*p   = '\0';
 
+	// Yay, Windows 10 *FINALLY* added actual Unicode support for OutputDebugStringW()!
+	wbuf = utf8_to_wchar(buf);
 	// Send output to Windows debug facility
-	OutputDebugStringA(buf);
-	// Send output to our log Window
-	Edit_SetSel(hLog, MAX_LOG_SIZE, MAX_LOG_SIZE);
-	Edit_ReplaceSelU(hLog, buf);
-	// Make sure the message scrolls into view
-	// (Or see code commented in LogProc:WM_SHOWWINDOW for a less forceful scroll)
-	SendMessage(hLog, EM_LINESCROLL, 0, SendMessage(hLog, EM_GETLINECOUNT, 0, 0));
+	OutputDebugStringW(wbuf);
+	if ((hLog != NULL) && (hLog != INVALID_HANDLE_VALUE)) {
+		// Send output to our log Window
+		Edit_SetSel(hLog, MAX_LOG_SIZE, MAX_LOG_SIZE);
+		Edit_ReplaceSel(hLog, wbuf);
+		// Make sure the message scrolls into view
+		// (Or see code commented in LogProc:WM_SHOWWINDOW for a less forceful scroll)
+		Edit_Scroll(hLog, Edit_GetLineCount(hLog), 0);
+	}
+	free(wbuf);
 }
 #endif
 
+// Prints a bitstring of a number of any size, with or without leading zeroes.
+// See also the printbits() and printbitslz() helper macros in rufus.h
+char *_printbits(size_t const size, void const * const ptr, int leading_zeroes)
+{
+	// sizeof(uintmax_t) so that we have enough space to store whatever is thrown at us
+	static char str[sizeof(uintmax_t) * 8 + 3];
+	size_t i;
+	uint8_t* b = (uint8_t*)ptr;
+	uintmax_t mask, lzmask = 0, val = 0;
+
+	// Little endian, the SCOURGE of any rational computing
+	for (i = 0; i < size; i++)
+		val |= ((uintmax_t)b[i]) << (8 * i);
+
+	str[0] = '0';
+	str[1] = 'b';
+	if (leading_zeroes)
+		lzmask = 1ULL << (size * 8 - 1);
+	for (i = 2, mask = 1ULL << (sizeof(uintmax_t) * 8 - 1); mask != 0; mask >>= 1) {
+		if ((i > 2) || (lzmask & mask))
+			str[i++] = (val & mask) ? '1' : '0';
+		else if (val & mask)
+			str[i++] = '1';
+	}
+	str[i] = '\0';
+	return str;
+}
+
+// Display an hex dump of buffer 'buf'
 void DumpBufferHex(void *buf, size_t size)
 {
 	unsigned char* buffer = (unsigned char*)buf;
@@ -104,10 +141,7 @@ void DumpBufferHex(void *buf, size_t size)
 	uprintf("%s\n", line);
 }
 
-/*
- * Convert a windows error to human readable string
- * uses retval as errorcode, or, if 0, use GetLastError()
- */
+// Convert a windows error to human readable string
 const char *WindowsErrorString(void)
 {
 static char err_string[256] = {0};
@@ -117,7 +151,7 @@ static char err_string[256] = {0};
 
 	error_code = GetLastError();
 
-	safe_sprintf(err_string, sizeof(err_string), "[0x%08X] ", error_code);
+	static_sprintf(err_string, "[0x%08lX] ", error_code);
 
 	size = FormatMessageU(FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS, NULL, HRESULT_CODE(error_code),
 		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), &err_string[strlen(err_string)],
@@ -125,10 +159,10 @@ static char err_string[256] = {0};
 	if (size == 0) {
 		format_error = GetLastError();
 		if ((format_error) && (format_error != 0x13D))		// 0x13D, decode error, is returned for unknown codes
-			safe_sprintf(err_string, sizeof(err_string),
-				"Windows error code 0x%08X (FormatMessage error code 0x%08X)", error_code, format_error);
+			static_sprintf(err_string, "Windows error code 0x%08lX (FormatMessage error code 0x%08lX)",
+				error_code, format_error);
 		else
-			safe_sprintf(err_string, sizeof(err_string), "Unknown error 0x%08X", error_code);
+			static_sprintf(err_string, "Unknown error 0x%08lX", error_code);
 	}
 
 	SetLastError(error_code);	// Make sure we don't change the errorcode on exit
@@ -147,7 +181,7 @@ char* GuidToString(const GUID* guid)
 	return guid_string;
 }
 
-// find upper power of 2
+// Find upper power of 2
 static __inline uint16_t upo2(uint16_t v)
 {
 	v--;
@@ -185,7 +219,7 @@ char* SizeToHumanReadable(uint64_t size, BOOL copy_to_log, BOOL fake_units)
 		} else {
 			t = (double)upo2((uint16_t)hr_size);
 			i_size = (uint16_t)((fabs(1.0f-(hr_size / t)) < 0.05f)?t:hr_size);
-			static_sprintf(str_size, "%s%d%s%s", dir, i_size, dir, _msg_table[MSG_020+suffix-MSG_000]);
+			static_sprintf(str_size, "%s%d%s %s", dir, i_size, dir, _msg_table[MSG_020+suffix-MSG_000]);
 		}
 	} else {
 		static_sprintf(str_size, (hr_size * 10.0 - (floor(hr_size) * 10.0)) < 0.5?
@@ -194,6 +228,24 @@ char* SizeToHumanReadable(uint64_t size, BOOL copy_to_log, BOOL fake_units)
 	return str_size;
 }
 
+// Convert a YYYYMMDDHHMMSS UTC timestamp to a more human readable version
+char* TimestampToHumanReadable(uint64_t ts)
+{
+	uint64_t rem = ts, divisor = 10000000000ULL;
+	uint16_t data[6];
+	int i;
+	static char str[64];
+
+	for (i = 0; i < 6; i++) {
+		data[i] = (uint16_t) ((divisor == 0)?rem:(rem / divisor));
+		rem %= divisor;
+		divisor /= 100ULL;
+	}
+	static_sprintf(str, "%04d.%02d.%02d %02d:%02d:%02d (UTC)", data[0], data[1], data[2], data[3], data[4], data[5]);
+	return str;
+}
+
+// Convert custom error code to messages
 const char* _StrError(DWORD error_code)
 {
 	if ( (!IS_ERROR(error_code)) || (SCODE_CODE(error_code) == ERROR_SUCCESS)) {
@@ -263,8 +315,9 @@ const char* _StrError(DWORD error_code)
 		return lmprintf(MSG_078);
 	case ERROR_NOT_READY:
 		return lmprintf(MSG_079);
+	case ERROR_BAD_SIGNATURE:
+		return lmprintf(MSG_172);
 	default:
-		uprintf("Unknown error: %08X\n", error_code);
 		SetLastError(error_code);
 		return WindowsErrorString();
 	}
@@ -279,4 +332,86 @@ const char* StrError(DWORD error_code, BOOL use_default_locale)
 	if (use_default_locale)
 		toggle_default_locale();
 	return ret;
+}
+
+// A WriteFile() equivalent, with up to nNumRetries write attempts on error.
+BOOL WriteFileWithRetry(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
+	LPDWORD lpNumberOfBytesWritten, DWORD nNumRetries)
+{
+	DWORD nTry;
+	BOOL readFilePointer;
+	LARGE_INTEGER liFilePointer, liZero = { { 0,0 } };
+
+	// Need to get the current file pointer in case we need to retry
+	readFilePointer = SetFilePointerEx(hFile, liZero, &liFilePointer, FILE_CURRENT);
+	if (!readFilePointer)
+		uprintf("Warning: Could not read file pointer: %s", WindowsErrorString());
+
+	if (nNumRetries == 0)
+		nNumRetries = 1;
+	for (nTry = 1; nTry <= nNumRetries; nTry++) {
+		// Need to rewind our file position on retry - if we can't even do that, just give up
+		if ((nTry > 1) && (!SetFilePointerEx(hFile, liFilePointer, NULL, FILE_BEGIN))) {
+			uprintf("Could not set file pointer - Aborting");
+			break;
+		}
+		if (WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, NULL)) {
+			if (nNumberOfBytesToWrite == *lpNumberOfBytesWritten)
+				return TRUE;
+			// Some large drives return 0, even though all the data was written - See github #787 */
+			if (large_drive && (*lpNumberOfBytesWritten == 0)) {
+				uprintf("Warning: Possible short write");
+				return TRUE;
+			}
+			uprintf("Wrote %d bytes but requested %d", *lpNumberOfBytesWritten, nNumberOfBytesToWrite);
+		} else {
+			uprintf("Write error [0x%08X]", GetLastError());
+		}
+		// If we can't reposition for the next run, just abort
+		if (!readFilePointer)
+			break;
+		if (nTry < nNumRetries) {
+			uprintf("Retrying in %d seconds...", WRITE_TIMEOUT / 1000);
+			Sleep(WRITE_TIMEOUT);
+		}
+	}
+	if (SCODE_CODE(GetLastError()) == ERROR_SUCCESS)
+		SetLastError(ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_WRITE_FAULT);
+	return FALSE;
+}
+
+// A WaitForSingleObject() equivalent that doesn't block Windows messages
+// This is needed, for instance, if you are waiting for a thread that may issue uprintf's
+DWORD WaitForSingleObjectWithMessages(HANDLE hHandle, DWORD dwMilliseconds)
+{
+	uint64_t CurTime, EndTime = GetTickCount64() + dwMilliseconds;
+	DWORD res;
+	MSG msg;
+
+	do {
+		// Read all of the messages in this next loop, removing each message as we read it.
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			if ((msg.message == WM_QUIT) || (msg.message == WM_CLOSE)) {
+				SetLastError(ERROR_CANCELLED);
+				return WAIT_FAILED;
+			} else {
+				DispatchMessage(&msg);
+			}
+		}
+
+		// Wait for any message sent or posted to this queue or for the handle to signaled.
+		res = MsgWaitForMultipleObjects(1, &hHandle, FALSE, dwMilliseconds, QS_ALLINPUT);
+
+		if (dwMilliseconds != INFINITE) {
+			CurTime = GetTickCount64();
+			// Account for the case where we may reach the timeout condition while
+			// processing timestamps
+			if (CurTime < EndTime)
+				dwMilliseconds = (DWORD) (EndTime - CurTime);
+			else
+				res = WAIT_TIMEOUT;
+		}
+	} while (res == (WAIT_OBJECT_0 + 1));
+
+	return res;
 }
